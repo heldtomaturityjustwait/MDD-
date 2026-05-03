@@ -68,6 +68,7 @@ import numpy as np
 from phonological_features import (
     PHONOLOGICAL_FEATURES,
     NUM_FEATURES,
+    BLANK_IDX,
     NUM_OUTPUT_NODES,
     PHONEME_FEATURES,
     feature_idx_to_pos_node,
