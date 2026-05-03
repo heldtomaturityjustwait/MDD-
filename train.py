@@ -125,6 +125,7 @@ def evaluate(model, loader, device) -> list:
     """
     model.eval()
     all_ref, all_hyp = [], []
+    total_ref_len = total_hyp_len = total_blank_frac = n_batches = 0
 
     for batch in loader:
         input_values  = batch["input_values"].to(device)
@@ -132,13 +133,27 @@ def evaluate(model, loader, device) -> list:
         attention_mask = build_attention_mask(input_values, input_lengths)
 
         logits, _ = model(input_values, attention_mask)
-        decoded   = model.decode(logits)    # [B][35][list[bool]]
+
+        # Diagnostic: how often does blank (node 70) win across all frames?
+        blank_wins = (logits.argmax(dim=-1) == 70).float().mean().item()
+        total_blank_frac += blank_wins
+        n_batches += 1
+
+        decoded = model.decode(logits)
 
         for b, phones in enumerate(batch["actual_phones"]):
             ref_feat = phoneme_sequence_to_feature_sequences(phones)
             ref_bool = [[bool(v) for v in seq] for seq in ref_feat]
             all_ref.append(ref_bool)
             all_hyp.append(decoded[b])
+            total_ref_len += len(phones)
+            total_hyp_len += len(decoded[b][0]) if decoded[b][0] else 0
+
+    avg_blank = total_blank_frac / max(n_batches, 1)
+    avg_ref   = total_ref_len / max(len(all_ref), 1)
+    avg_hyp   = total_hyp_len / max(len(all_hyp), 1)
+    logger.info(f"  [Eval diag] blank_win_rate={avg_blank*100:.1f}% | "
+                f"avg_ref_len={avg_ref:.1f} | avg_hyp_len={avg_hyp:.1f}")
 
     return compute_all_feature_metrics(all_ref, all_hyp)
 
