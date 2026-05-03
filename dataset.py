@@ -344,18 +344,33 @@ class TIMITDataset(Dataset):
 
     def _collect_samples(self) -> list[dict]:
         samples = []
-        # Walk DR{1-8}/<SPEAKER>/<UTT>.PHN
-        for phn_file in sorted(self.root.rglob("*.PHN")):
-            # Also accept lowercase .phn
-            wav_file = phn_file.with_suffix(".WAV")
-            if not wav_file.exists():
-                wav_file = phn_file.with_suffix(".wav")
-            if not wav_file.exists():
-                continue   # no matching audio — skip
+        # rglob is case-sensitive on Linux — try both .PHN and .phn
+        phn_files = sorted(self.root.rglob("*.PHN"))
+        if not phn_files:
+            phn_files = sorted(self.root.rglob("*.phn"))
+
+        for phn_file in phn_files:
+            # Skip SA sentences — same 2 prompts read by all 630 speakers,
+            # would leak identical text across train/test splits
+            if phn_file.stem.lower().startswith("sa"):
+                continue
+
+            # Match wav: handles SX217.WAV, SX127.WAV.wav, sx217.wav, etc.
+            stem = phn_file.stem   # e.g. "SX37" or "SI1027"
+            parent = phn_file.parent
+            wav_file = None
+            for candidate in parent.iterdir():
+                cname = candidate.name.lower()
+                cstem = cname.split(".")[0]   # strip all extensions
+                if cstem == stem.lower() and cname.endswith((".wav",)):
+                    wav_file = candidate
+                    break
+            if wav_file is None:
+                continue
 
             phones = parse_phn_file(str(phn_file))
             if not phones:
-                continue   # empty or all-silence utterance — skip
+                continue
 
             samples.append({
                 "wav_path": str(wav_file),
@@ -371,7 +386,18 @@ class TIMITDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         item = self.samples[idx]
 
-        waveform, sr = torchaudio.load(item["wav_path"])
+        # TIMIT .WAV files are NIST sphere format — try torchaudio first,
+        # fall back to scipy which handles sphere natively
+        try:
+            waveform, sr = torchaudio.load(item["wav_path"])
+        except Exception:
+            import scipy.io.wavfile as sciwav
+            import numpy as np
+            sr, data = sciwav.read(item["wav_path"])
+            if data.dtype != np.float32:
+                data = data.astype(np.float32) / np.iinfo(data.dtype).max
+            waveform = torch.from_numpy(data).unsqueeze(0)
+
         if sr != self.sample_rate:
             waveform = torchaudio.functional.resample(waveform, sr, self.sample_rate)
         waveform = waveform.mean(dim=0)
