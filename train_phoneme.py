@@ -39,16 +39,22 @@ Task 2 — Phoneme Error Rate (PER):
 Usage:
     python train_phoneme.py \
         --config    config.yaml \
-        --timit_dir /path/to/timit/data \
         --data_dir  /path/to/l2arctic \
+        --output_dir /path/to/phoneme_output
+
+    # With TIMIT (recommended):
+    python train_phoneme.py \
+        --config    config.yaml \
+        --data_dir  /path/to/l2arctic \
+        --timit_dir /path/to/timit \
         --output_dir /path/to/phoneme_output
 
     # Resume:
     python train_phoneme.py \
-        --config    config.yaml \
-        --data_dir  /path/to/l2arctic \
+        --config     config.yaml \
+        --data_dir   /path/to/l2arctic \
         --output_dir /path/to/phoneme_output \
-        --resume    /path/to/phoneme_output/best_phoneme_model.pt
+        --resume     /path/to/phoneme_output/best_phoneme_model.pt
 """
 
 import os
@@ -68,8 +74,9 @@ from transformers import get_linear_schedule_with_warmup
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dataset import (
-    get_train_test_datasets,
-    get_suitcase_train_test_datasets,
+    TIMITDataset,
+    get_l2arctic_train_test,
+    get_suitcase_train_test,
     collate_fn,
 )
 from wav2vec2_phonological import PhonemeLevelWav2Vec2
@@ -166,7 +173,7 @@ def phones_to_feature_seqs(phones: list[str]) -> list[list[bool]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PER metric — for monitoring during training
+# PER metric
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PERCounts:
@@ -213,10 +220,10 @@ def train_epoch(
         attention_mask = build_attention_mask(input_values, input_lengths)
 
         logits, output_lengths = model(input_values, attention_mask)
-        logits_t = logits.transpose(0, 1)   # (T, B, 40)
+        logits_t       = logits.transpose(0, 1)   # (T, B, 40)
         output_lengths = output_lengths.clamp(max=logits_t.shape[0])
 
-        # CTC targets: actual_phones → phoneme indices (sil excluded)
+        # CTC targets: actual_phones → phoneme indices
         targets        = []
         target_lengths = []
         for phones in batch["actual_phones"]:
@@ -290,8 +297,8 @@ def evaluate(
     Reference is built from actual_phones exactly as in train.py.
     """
     model.eval()
-    all_ref_seqs = []   # [N_utts][35][U_ref] bool
-    all_hyp_seqs = []   # [N_utts][35][U_hyp] bool
+    all_ref_seqs = []
+    all_hyp_seqs = []
     per_counts   = PERCounts()
 
     for batch_idx, batch in enumerate(loader):
@@ -306,15 +313,10 @@ def evaluate(
             actual = [p for p in batch["actual_phones"][b] if p != "sil"]
             recog  = recognized_batch[b]
 
-            # PER accumulation
             if actual:
                 per_counts.update(actual, recog)
 
-            # Reference: actual_phones → feature sequences
             ref_feat_seqs = phones_to_feature_seqs(actual)
-
-            # Hypothesis: recognized_phones → feature sequences
-            # If model output is empty, produce empty sequences
             hyp_feat_seqs = phones_to_feature_seqs(recog)
 
             all_ref_seqs.append(ref_feat_seqs)
@@ -338,10 +340,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Train phoneme-level CTC baseline for MDD comparison"
     )
-    parser.add_argument("--config",     type=str, default="config.yaml")
-    parser.add_argument("--data_dir",   type=str, required=True)
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--resume",     type=str, default=None)
+    parser.add_argument("--config",      type=str, default="config.yaml")
+    parser.add_argument("--data_dir",    type=str, required=True,
+                        help="L2-ARCTIC root directory")
+    parser.add_argument("--timit_dir",   type=str, default=None,
+                        help="TIMIT root directory (optional, adds TRAIN split)")
+    parser.add_argument("--output_dir",  type=str, required=True)
+    parser.add_argument("--resume",      type=str, default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -355,24 +360,36 @@ def main():
     # ── Datasets — identical split to SCTC-SB model ──────────────────────
     train_datasets = []
 
-
-    l2_train_ds, l2_test_ds = get_train_test_datasets(
+    # 1. L2-ARCTIC annotated scripted utterances
+    l2_train, l2_test = get_l2arctic_train_test(
         l2arctic_root=args.data_dir,
-        split="scripted",
         max_duration=cfg["data"]["max_duration"],
     )
-    train_datasets.append(l2_train_ds)
-    logger.info(f"L2-Scripted: train={len(l2_train_ds)} | test={len(l2_test_ds)}")
+    train_datasets.append(l2_train)
+    logger.info(f"L2-ARCTIC scripted: train={len(l2_train)} | test={len(l2_test)}")
 
-    suit_train_ds, suit_test_ds = get_suitcase_train_test_datasets(
+    # 2. L2-ARCTIC suitcase (spontaneous)
+    suit_train, suit_test = get_suitcase_train_test(
         l2arctic_root=args.data_dir,
         max_chunk_duration=10.0,
     )
-    train_datasets.append(suit_train_ds)
-    logger.info(f"Suitcase: train={len(suit_train_ds)} | test={len(suit_test_ds)}")
+    train_datasets.append(suit_train)
+    logger.info(f"Suitcase: train={len(suit_train)} | test={len(suit_test)}")
+
+    # 3. TIMIT (optional)
+    if args.timit_dir:
+        timit_ds = TIMITDataset(
+            timit_root=args.timit_dir,
+            split="TRAIN",
+            max_duration=cfg["data"]["max_duration"],
+        )
+        train_datasets.append(timit_ds)
+        logger.info(f"TIMIT TRAIN: {len(timit_ds)} utterances")
+    else:
+        logger.info("TIMIT not provided — training on L2-ARCTIC only")
 
     train_ds = ConcatDataset(train_datasets)
-    logger.info(f"Total train utterances: {len(train_ds)}")
+    logger.info(f"Total training utterances: {len(train_ds)}")
 
     bs          = cfg["training"]["batch_size"]
     num_workers = cfg["data"].get("num_workers", 4)
@@ -382,11 +399,11 @@ def main():
         collate_fn=collate_fn, num_workers=num_workers, pin_memory=True,
     )
     test_loader = DataLoader(
-        l2_test_ds, batch_size=bs, shuffle=False,
+        l2_test, batch_size=bs, shuffle=False,
         collate_fn=collate_fn, num_workers=num_workers,
     )
     suit_loader = DataLoader(
-        suit_test_ds, batch_size=bs, shuffle=False,
+        suit_test, batch_size=bs, shuffle=False,
         collate_fn=collate_fn, num_workers=num_workers,
     )
 
@@ -437,10 +454,9 @@ def main():
         logger.info(f"Resumed from epoch {ckpt.get('epoch', '?')}")
 
     # ── Training loop ─────────────────────────────────────────────────────
-    # Saved by Avg ACC (feature-level) — matches train.py criterion exactly
     best_avg_acc = 0.0
-    log_every  = cfg["training"].get("log_every", 50)
-    save_every = cfg["training"].get("save_every", 5)
+    log_every    = cfg["training"].get("log_every", 50)
+    save_every   = cfg["training"].get("save_every", 5)
 
     for epoch in range(start_epoch, num_epochs + 1):
         logger.info(f"\n{'='*60}")
@@ -453,16 +469,18 @@ def main():
             optimizer, scheduler,
             device, grad_accum, epoch, log_every,
         )
-        elapsed = time.time() - t0
-        logger.info(f"  Epoch {epoch} train loss: {train_loss:.4f} | time: {elapsed:.0f}s")
+        logger.info(
+            f"  Epoch {epoch} loss={train_loss:.4f} | "
+            f"time={time.time()-t0:.0f}s"
+        )
 
-        logger.info("  Evaluating on L2-Scripted test set...")
+        logger.info("  Evaluating on L2-Scripted annotated test set...")
         metrics_s, per_s = evaluate(model, test_loader, device, "L2-Scripted")
         avg_acc_s = sum(m.accuracy for m in metrics_s) / len(metrics_s)
         avg_f1_s  = sum(m.f1       for m in metrics_s) / len(metrics_s)
         logger.info(
-            f"  [Scripted] Avg ACC: {avg_acc_s*100:.2f}% | "
-            f"Avg F1: {avg_f1_s*100:.2f}% | {per_s.summary()}"
+            f"  [Scripted] Avg ACC={avg_acc_s*100:.2f}% | "
+            f"F1={avg_f1_s*100:.2f}% | {per_s.summary()}"
         )
 
         logger.info("  Evaluating on L2-Suitcase test set...")
@@ -470,11 +488,10 @@ def main():
         avg_acc_u = sum(m.accuracy for m in metrics_u) / len(metrics_u)
         avg_f1_u  = sum(m.f1       for m in metrics_u) / len(metrics_u)
         logger.info(
-            f"  [Suitcase] Avg ACC: {avg_acc_u*100:.2f}% | "
-            f"Avg F1: {avg_f1_u*100:.2f}% | {per_u.summary()}"
+            f"  [Suitcase] Avg ACC={avg_acc_u*100:.2f}% | "
+            f"F1={avg_f1_u*100:.2f}% | {per_u.summary()}"
         )
 
-        # Save best by Scripted Avg ACC — matches train.py
         if avg_acc_s > best_avg_acc:
             best_avg_acc = avg_acc_s
             best_path = Path(args.output_dir) / "best_phoneme_model.pt"
@@ -486,7 +503,7 @@ def main():
                 "loss":                 train_loss,
             }, best_path)
             logger.info(
-                f"  ★ New best model saved "
+                f"  ★ New best model "
                 f"(Scripted ACC={best_avg_acc*100:.2f}%)"
             )
 
@@ -509,7 +526,7 @@ def main():
     )
     model.load_state_dict(ckpt["model_state_dict"])
 
-    logger.info("\n--- L2-Scripted ---")
+    logger.info("\n--- L2-Scripted annotated ---")
     metrics_s, per_s = evaluate(model, test_loader, device, "L2-Scripted")
     logger.info(f"PER: {per_s.summary()}")
     print_feature_metrics(metrics_s)
