@@ -49,16 +49,17 @@ class SCTCSBLoss(nn.Module):
         num_features: int = NUM_FEATURES,
         blank_idx: int = BLANK_IDX,
         reduction: str = "mean",
+        blank_penalty: float = 2.0,
     ):
         super().__init__()
         self.num_features = num_features
         self.blank_idx = blank_idx
         self.reduction = reduction
-
-        # For each feature i, the 3 active node indices are:
-        #   pos_node = i        (+att)
-        #   neg_node = i + 35   (-att)
-        #   blank    = 70       (shared blank)
+        # blank_penalty: subtracted from blank logit before per-category softmax.
+        # The shared blank receives gradient from all 35 categories simultaneously,
+        # making it 35x stronger than any feature node. A penalty of ~2.0
+        # counteracts this. Tune upward (3.0, 4.0) if blank_win_rate stays high.
+        self.blank_penalty = blank_penalty
         self._build_category_node_maps()
 
     def _build_category_node_maps(self):
@@ -100,9 +101,9 @@ class SCTCSBLoss(nn.Module):
             # ── Extract the 3-node logits for this category ───────────────
             # Shape: (T, B, 3)
             cat_logits = torch.stack([
-                logits[:, :, pos_node],    # +att
-                logits[:, :, neg_node],    # -att
-                logits[:, :, self.blank_idx],  # shared blank
+                logits[:, :, pos_node],                              # +att
+                logits[:, :, neg_node],                              # -att
+                logits[:, :, self.blank_idx] - self.blank_penalty,  # shared blank (penalised)
             ], dim=-1)  # (T, B, 3)
 
             # Log-softmax over the 3 nodes
