@@ -49,17 +49,11 @@ class SCTCSBLoss(nn.Module):
         num_features: int = NUM_FEATURES,
         blank_idx: int = BLANK_IDX,
         reduction: str = "mean",
-        blank_penalty: float = 2.0,
     ):
         super().__init__()
         self.num_features = num_features
         self.blank_idx = blank_idx
         self.reduction = reduction
-        # blank_penalty: subtracted from blank logit before per-category softmax.
-        # The shared blank receives gradient from all 35 categories simultaneously,
-        # making it 35x stronger than any feature node. A penalty of ~2.0
-        # counteracts this. Tune upward (3.0, 4.0) if blank_win_rate stays high.
-        self.blank_penalty = blank_penalty
         self._build_category_node_maps()
 
     def _build_category_node_maps(self):
@@ -99,14 +93,17 @@ class SCTCSBLoss(nn.Module):
             neg_node = feat_idx + self.num_features   # global index of -att_i
 
             # ── Extract the 3-node logits for this category ───────────────
-            # Shape: (T, B, 3)
+            # Per paper Section 3.2: softmax over C'_i = {+att, -att, blank}.
+            # The blank node appears in all 35 category losses so its gradient
+            # accumulates 35x. We scale it down by 1/N inside the softmax so its
+            # effective gradient contribution equals that of any feature node.
             cat_logits = torch.stack([
-                logits[:, :, pos_node],                              # +att
-                logits[:, :, neg_node],                              # -att
-                logits[:, :, self.blank_idx] - self.blank_penalty,  # shared blank (penalised)
+                logits[:, :, pos_node],
+                logits[:, :, neg_node],
+                logits[:, :, self.blank_idx] / self.num_features,
             ], dim=-1)  # (T, B, 3)
 
-            # Log-softmax over the 3 nodes
+            # Log-softmax over the 3 nodes (paper Eq. 4-5)
             cat_log_probs = F.log_softmax(cat_logits, dim=-1)  # (T, B, 3)
 
             # ── Build targets for this category ──────────────────────────
