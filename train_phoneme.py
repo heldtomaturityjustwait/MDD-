@@ -68,17 +68,12 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader
 from transformers import get_linear_schedule_with_warmup
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from dataset import (
-    TIMITDataset,
-    get_l2arctic_train_test,
-    get_suitcase_train_test,
-    collate_fn,
-)
+from dataset import get_datasets, collate_fn
 from wav2vec2_phonological import PhonemeLevelWav2Vec2
 from phonological_features import (
     CMU_39_PHONEMES,
@@ -358,38 +353,12 @@ def main():
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
 
     # ── Datasets — identical split to SCTC-SB model ──────────────────────
-    train_datasets = []
-
-    # 1. L2-ARCTIC annotated scripted utterances
-    l2_train, l2_test = get_l2arctic_train_test(
+    train_ds, test_ds = get_datasets(
         l2arctic_root=args.data_dir,
+        timit_root=args.timit_dir,
         max_duration=cfg["data"]["max_duration"],
-    )
-    train_datasets.append(l2_train)
-    logger.info(f"L2-ARCTIC scripted: train={len(l2_train)} | test={len(l2_test)}")
-
-    # 2. L2-ARCTIC suitcase (spontaneous)
-    suit_train, suit_test = get_suitcase_train_test(
-        l2arctic_root=args.data_dir,
         max_chunk_duration=10.0,
     )
-    train_datasets.append(suit_train)
-    logger.info(f"Suitcase: train={len(suit_train)} | test={len(suit_test)}")
-
-    # 3. TIMIT (optional)
-    if args.timit_dir:
-        timit_ds = TIMITDataset(
-            timit_root=args.timit_dir,
-            split="TRAIN",
-            max_duration=cfg["data"]["max_duration"],
-        )
-        train_datasets.append(timit_ds)
-        logger.info(f"TIMIT TRAIN: {len(timit_ds)} utterances")
-    else:
-        logger.info("TIMIT not provided — training on L2-ARCTIC only")
-
-    train_ds = ConcatDataset(train_datasets)
-    logger.info(f"Total training utterances: {len(train_ds)}")
 
     bs          = cfg["training"]["batch_size"]
     num_workers = cfg["data"].get("num_workers", 4)
@@ -399,11 +368,7 @@ def main():
         collate_fn=collate_fn, num_workers=num_workers, pin_memory=True,
     )
     test_loader = DataLoader(
-        l2_test, batch_size=bs, shuffle=False,
-        collate_fn=collate_fn, num_workers=num_workers,
-    )
-    suit_loader = DataLoader(
-        suit_test, batch_size=bs, shuffle=False,
+        test_ds, batch_size=bs, shuffle=False,
         collate_fn=collate_fn, num_workers=num_workers,
     )
 
@@ -474,26 +439,14 @@ def main():
             f"time={time.time()-t0:.0f}s"
         )
 
-        logger.info("  Evaluating on L2-Scripted annotated test set...")
-        metrics_s, per_s = evaluate(model, test_loader, device, "L2-Scripted")
-        avg_acc_s = sum(m.accuracy for m in metrics_s) / len(metrics_s)
-        avg_f1_s  = sum(m.f1       for m in metrics_s) / len(metrics_s)
-        logger.info(
-            f"  [Scripted] Avg ACC={avg_acc_s*100:.2f}% | "
-            f"F1={avg_f1_s*100:.2f}% | {per_s.summary()}"
-        )
+        logger.info("  Evaluating on test set...")
+        metrics, per = evaluate(model, test_loader, device, "Test")
+        avg_acc = sum(m.accuracy for m in metrics) / len(metrics)
+        avg_f1  = sum(m.f1       for m in metrics) / len(metrics)
+        logger.info(f"  Avg ACC={avg_acc*100:.2f}% | F1={avg_f1*100:.2f}% | {per.summary()}")
 
-        logger.info("  Evaluating on L2-Suitcase test set...")
-        metrics_u, per_u = evaluate(model, suit_loader, device, "L2-Suitcase")
-        avg_acc_u = sum(m.accuracy for m in metrics_u) / len(metrics_u)
-        avg_f1_u  = sum(m.f1       for m in metrics_u) / len(metrics_u)
-        logger.info(
-            f"  [Suitcase] Avg ACC={avg_acc_u*100:.2f}% | "
-            f"F1={avg_f1_u*100:.2f}% | {per_u.summary()}"
-        )
-
-        if avg_acc_s > best_avg_acc:
-            best_avg_acc = avg_acc_s
+        if avg_acc > best_avg_acc:
+            best_avg_acc = avg_acc
             best_path = Path(args.output_dir) / "best_phoneme_model.pt"
             torch.save({
                 "epoch":                epoch,
@@ -502,10 +455,7 @@ def main():
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss":                 train_loss,
             }, best_path)
-            logger.info(
-                f"  ★ New best model "
-                f"(Scripted ACC={best_avg_acc*100:.2f}%)"
-            )
+            logger.info(f"  ★ New best model (ACC={best_avg_acc*100:.2f}%)")
 
         if epoch % save_every == 0:
             ckpt_path = Path(args.output_dir) / f"phoneme_epoch_{epoch:02d}.pt"
@@ -526,15 +476,9 @@ def main():
     )
     model.load_state_dict(ckpt["model_state_dict"])
 
-    logger.info("\n--- L2-Scripted annotated ---")
-    metrics_s, per_s = evaluate(model, test_loader, device, "L2-Scripted")
-    logger.info(f"PER: {per_s.summary()}")
-    print_feature_metrics(metrics_s)
-
-    logger.info("\n--- L2-Suitcase ---")
-    metrics_u, per_u = evaluate(model, suit_loader, device, "L2-Suitcase")
-    logger.info(f"PER: {per_u.summary()}")
-    print_feature_metrics(metrics_u)
+    metrics, per = evaluate(model, test_loader, device, "Test")
+    logger.info(f"PER: {per.summary()}")
+    print_feature_metrics(metrics)
 
     logger.info("Training complete!")
 

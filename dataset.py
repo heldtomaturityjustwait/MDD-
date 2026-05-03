@@ -614,17 +614,38 @@ def collate_fn(batch: list[dict]) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Convenience factory functions
+# Unified factory function
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_l2arctic_train_test(
+def get_datasets(
     l2arctic_root: str,
+    timit_root: str | None = None,
     max_duration: float = 15.0,
-) -> tuple[L2ArcticDataset, L2ArcticDataset]:
+    max_chunk_duration: float = 10.0,
+) -> tuple["ConcatDataset", "ConcatDataset"]:
     """
-    Split L2-ARCTIC scripted speakers into train / test.
-    Only annotated utterances are included in both sets.
+    Build a single train dataset and a single test dataset from all sources.
+
+    Train = L2-ARCTIC annotated train speakers
+          + L2-ARCTIC suitcase train speakers
+          + TIMIT TRAIN (if timit_root is provided)
+
+    Test  = L2-ARCTIC annotated test speakers
+          + L2-ARCTIC suitcase test speakers
+          (TIMIT TEST is not used — evaluation is always on L2 speakers)
+
+    Args:
+        l2arctic_root      : path to L2-ARCTIC root directory
+        timit_root         : path to TIMIT root (optional)
+        max_duration       : max clip length in seconds for scripted / TIMIT
+        max_chunk_duration : max chunk length in seconds for suitcase
+
+    Returns:
+        train_ds, test_ds  : ConcatDataset instances ready for DataLoader
     """
+    from torch.utils.data import ConcatDataset
+
+    # ── L2-ARCTIC scripted (annotation/ only) ────────────────────────────
     root = Path(l2arctic_root)
     all_speakers = sorted([
         d.name for d in root.iterdir()
@@ -633,36 +654,39 @@ def get_l2arctic_train_test(
     if not all_speakers:
         raise ValueError(f"No speaker directories found in {l2arctic_root}")
 
-    test_spk  = [s for s in all_speakers if s in SCRIPTED_TEST_SPEAKERS]
-    train_spk = [s for s in all_speakers if s not in SCRIPTED_TEST_SPEAKERS]
+    l2_test_spk  = [s for s in all_speakers if s in SCRIPTED_TEST_SPEAKERS]
+    l2_train_spk = [s for s in all_speakers if s not in SCRIPTED_TEST_SPEAKERS]
 
-    print(f"L2-ARCTIC train speakers ({len(train_spk)}): {train_spk}")
-    print(f"L2-ARCTIC test  speakers ({len(test_spk)}):  {test_spk}")
+    print(f"L2-ARCTIC scripted train speakers ({len(l2_train_spk)}): {l2_train_spk}")
+    print(f"L2-ARCTIC scripted test  speakers ({len(l2_test_spk)}):  {l2_test_spk}")
 
-    return (
-        L2ArcticDataset(l2arctic_root, train_spk, max_duration),
-        L2ArcticDataset(l2arctic_root, test_spk,  max_duration),
-    )
+    l2_train = L2ArcticDataset(l2arctic_root, l2_train_spk, max_duration)
+    l2_test  = L2ArcticDataset(l2arctic_root, l2_test_spk,  max_duration)
 
+    # ── L2-ARCTIC suitcase ────────────────────────────────────────────────
+    wav_dir = root / "suitcase_corpus" / "wav"
+    all_suit_spk = sorted([f.stem.upper() for f in wav_dir.glob("*.wav")])
 
-def get_suitcase_train_test(
-    l2arctic_root: str,
-    max_chunk_duration: float = 10.0,
-) -> tuple[SuitcaseDataset, SuitcaseDataset]:
-    """
-    Split suitcase speakers into train / test.
-    ASI and SKA are excluded (did not record suitcase).
-    """
-    wav_dir = Path(l2arctic_root) / "suitcase_corpus" / "wav"
-    all_spk = sorted([f.stem.upper() for f in wav_dir.glob("*.wav")])
+    suit_test_spk  = [s for s in all_suit_spk if s in SUITCASE_TEST_SPEAKERS]
+    suit_train_spk = [s for s in all_suit_spk if s not in SUITCASE_TEST_SPEAKERS]
 
-    test_spk  = [s for s in all_spk if s in SUITCASE_TEST_SPEAKERS]
-    train_spk = [s for s in all_spk if s not in SUITCASE_TEST_SPEAKERS]
+    print(f"Suitcase train speakers ({len(suit_train_spk)}): {suit_train_spk}")
+    print(f"Suitcase test  speakers ({len(suit_test_spk)}):  {suit_test_spk}")
 
-    print(f"Suitcase train speakers ({len(train_spk)}): {train_spk}")
-    print(f"Suitcase test  speakers ({len(test_spk)}):  {test_spk}")
+    suit_train = SuitcaseDataset(l2arctic_root, suit_train_spk, max_chunk_duration)
+    suit_test  = SuitcaseDataset(l2arctic_root, suit_test_spk,  max_chunk_duration)
 
-    return (
-        SuitcaseDataset(l2arctic_root, train_spk, max_chunk_duration),
-        SuitcaseDataset(l2arctic_root, test_spk,  max_chunk_duration),
-    )
+    # ── TIMIT (train only) ────────────────────────────────────────────────
+    train_parts = [l2_train, suit_train]
+    if timit_root and Path(timit_root).exists():
+        timit_ds = TIMITDataset(timit_root, split="TRAIN", max_duration=max_duration)
+        train_parts.append(timit_ds)
+        print(f"TIMIT TRAIN: {len(timit_ds)} utterances added")
+    else:
+        print("TIMIT not provided — training on L2-ARCTIC only")
+
+    train_ds = ConcatDataset(train_parts)
+    test_ds  = ConcatDataset([l2_test, suit_test])
+
+    print(f"\nTotal train: {len(train_ds)} | Total test: {len(test_ds)}")
+    return train_ds, test_ds

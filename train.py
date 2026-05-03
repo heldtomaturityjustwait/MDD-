@@ -30,17 +30,12 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader
 from transformers import get_linear_schedule_with_warmup
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from dataset import (
-    TIMITDataset,
-    get_l2arctic_train_test,
-    get_suitcase_train_test,
-    collate_fn,
-)
+from dataset import get_datasets, collate_fn
 from phonological_features import (
     phoneme_sequence_to_feature_sequences,
     NUM_FEATURES,
@@ -187,38 +182,12 @@ def main():
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
 
     # ── Build datasets ────────────────────────────────────────────────────
-    train_datasets = []
-
-    # 1. L2-ARCTIC annotated scripted utterances
-    l2_train, l2_test = get_l2arctic_train_test(
+    train_ds, test_ds = get_datasets(
         l2arctic_root=args.data_dir,
+        timit_root=args.timit_dir,
         max_duration=cfg["data"]["max_duration"],
-    )
-    train_datasets.append(l2_train)
-    logger.info(f"L2-ARCTIC scripted: train={len(l2_train)} | test={len(l2_test)}")
-
-    # 2. L2-ARCTIC suitcase (spontaneous)
-    suit_train, suit_test = get_suitcase_train_test(
-        l2arctic_root=args.data_dir,
         max_chunk_duration=10.0,
     )
-    train_datasets.append(suit_train)
-    logger.info(f"Suitcase: train={len(suit_train)} | test={len(suit_test)}")
-
-    # 3. TIMIT (optional)
-    if args.timit_dir:
-        timit_ds = TIMITDataset(
-            timit_root=args.timit_dir,
-            split="TRAIN",
-            max_duration=cfg["data"]["max_duration"],
-        )
-        train_datasets.append(timit_ds)
-        logger.info(f"TIMIT TRAIN: {len(timit_ds)} utterances")
-    else:
-        logger.info("TIMIT not provided — training on L2-ARCTIC only")
-
-    train_ds = ConcatDataset(train_datasets)
-    logger.info(f"Total training utterances: {len(train_ds)}")
 
     # ── DataLoaders ───────────────────────────────────────────────────────
     bs          = cfg["training"]["batch_size"]
@@ -229,11 +198,7 @@ def main():
         collate_fn=collate_fn, num_workers=num_workers, pin_memory=True,
     )
     test_loader = DataLoader(
-        l2_test, batch_size=bs, shuffle=False,
-        collate_fn=collate_fn, num_workers=num_workers,
-    )
-    suit_loader = DataLoader(
-        suit_test, batch_size=bs, shuffle=False,
+        test_ds, batch_size=bs, shuffle=False,
         collate_fn=collate_fn, num_workers=num_workers,
     )
 
@@ -297,25 +262,17 @@ def main():
             f"time={time.time()-t0:.0f}s"
         )
 
-        # Evaluate on L2-Scripted annotated test set
-        logger.info("  Evaluating on L2-Scripted annotated test set...")
-        metrics_s = evaluate(model, test_loader, device)
-        acc_s = sum(m.accuracy for m in metrics_s) / len(metrics_s)
-        f1_s  = sum(m.f1       for m in metrics_s) / len(metrics_s)
-        logger.info(f"  [Scripted] Avg ACC={acc_s*100:.2f}% | F1={f1_s*100:.2f}%")
+        logger.info("  Evaluating on test set...")
+        metrics = evaluate(model, test_loader, device)
+        acc = sum(m.accuracy for m in metrics) / len(metrics)
+        f1  = sum(m.f1       for m in metrics) / len(metrics)
+        logger.info(f"  Avg ACC={acc*100:.2f}% | F1={f1*100:.2f}%")
 
-        # Evaluate on suitcase test set
-        logger.info("  Evaluating on L2-Suitcase test set...")
-        metrics_u = evaluate(model, suit_loader, device)
-        acc_u = sum(m.accuracy for m in metrics_u) / len(metrics_u)
-        f1_u  = sum(m.f1       for m in metrics_u) / len(metrics_u)
-        logger.info(f"  [Suitcase] Avg ACC={acc_u*100:.2f}% | F1={f1_u*100:.2f}%")
-
-        if acc_s > best_avg_acc:
-            best_avg_acc = acc_s
+        if acc > best_avg_acc:
+            best_avg_acc = acc
             best_path = Path(output_dir) / "best_model.pt"
             torch.save(model.state_dict(), best_path)
-            logger.info(f"  ★ New best model (Scripted ACC={acc_s*100:.2f}%)")
+            logger.info(f"  ★ New best model (ACC={acc*100:.2f}%)")
 
         if epoch % cfg["training"]["save_every"] == 0:
             save_checkpoint(model, optimizer, scheduler, epoch, train_loss, output_dir)
@@ -323,12 +280,7 @@ def main():
     # ── Final evaluation ──────────────────────────────────────────────────
     logger.info("\nFinal evaluation with best model...")
     model.load_state_dict(torch.load(Path(output_dir) / "best_model.pt"))
-
-    logger.info("\n--- L2-Scripted annotated ---")
     print_feature_metrics(evaluate(model, test_loader, device))
-
-    logger.info("\n--- L2-Suitcase ---")
-    print_feature_metrics(evaluate(model, suit_loader, device))
 
     logger.info("Training complete!")
 
