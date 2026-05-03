@@ -1,0 +1,70 @@
+data:
+  max_duration: 15.0
+  phoneme_set_size: 39
+  sample_rate: 16000
+l2arctic:
+  all_speakers:
+  - ASI
+  - RRBI
+  - SVBI
+  - TNI
+  - YBAA
+  - MBMPS
+  - SKA
+  - HQTV
+  - HJK
+  - HKK
+  - ZHAA
+  - BWC
+  - LXC
+  - NCC
+  - TXHC
+  - EBVS
+  - ERMS
+  - PNV
+  - YDCK
+  - YKWK
+  - THV
+  - TLV
+  test_speakers:
+  - ASI
+  - YBAA
+  - HJK
+  - BWC
+  - EBVS
+  - YDCK
+model:
+  freeze_cnn_encoder: true
+  num_features: 35
+  num_output_nodes: 71
+  pretrained_model_name: facebook/wav2vec2-large-robust
+paths:
+  l2arctic_dir: ./l2arctic
+  log_dir: ./outputs/logs
+  output_dir: ./outputs
+training:
+  batch_size: 32
+  gradient_accumulation_steps: 4
+  learning_rate: 0.0001
+  log_every: 50
+  max_grad_norm: 1.0
+  num_epochs: 30
+  save_every: 5
+  use_spec_augment: true
+  warmup_ratio: 0.1
+  weight_decay: 0.005
+whisper:
+  data:
+    max_duration: 30.0
+    num_workers: 2
+  model:
+    pretrained_model_name: openai/whisper-small
+  training:
+    batch_size: 32
+    gradient_accumulation_steps: 4
+    learning_rate: 0.0001
+    log_every: 50
+    num_epochs: 30
+    save_every: 5
+    warmup_ratio: 0.1
+    weight_decay: 0.005
