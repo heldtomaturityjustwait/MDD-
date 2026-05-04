@@ -43,28 +43,14 @@ paths:
   log_dir: ./outputs/logs
   output_dir: ./outputs
 training:
+  early_stopping_patience: 10
   batch_size: 32
   gradient_accumulation_steps: 4
   learning_rate: 0.0001
   log_every: 50
   max_grad_norm: 1.0
-  num_epochs: 30
+  num_epochs: 50
   save_every: 5
   use_spec_augment: true
   warmup_ratio: 0.1
   weight_decay: 0.005
-whisper:
-  data:
-    max_duration: 30.0
-    num_workers: 2
-  model:
-    pretrained_model_name: openai/whisper-small
-  training:
-    batch_size: 32
-    gradient_accumulation_steps: 4
-    learning_rate: 0.0001
-    log_every: 50
-    num_epochs: 30
-    save_every: 5
-    warmup_ratio: 0.1
-    weight_decay: 0.005

@@ -35,7 +35,7 @@ from transformers import get_linear_schedule_with_warmup, Wav2Vec2FeatureExtract
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from dataset import get_datasets, make_collate_fn
+from dataset import get_datasets_separate, make_collate_fn
 from phonological_features import (
     phoneme_sequence_to_feature_sequences,
     NUM_FEATURES,
@@ -108,7 +108,7 @@ def train_epoch(
 
 
 @torch.no_grad()
-def evaluate(model, loader, device) -> list:
+def evaluate(model, loader, device, label="Test") -> list:
     """
     Evaluate phonological feature recognition.
     Reference = actual_phones from annotations.
@@ -141,11 +141,9 @@ def evaluate(model, loader, device) -> list:
             total_ref_len += len(phones)
             total_hyp_len += len(decoded[b][0]) if decoded[b][0] else 0
 
-    avg_blank = total_blank_frac / max(n_batches, 1)
     avg_ref   = total_ref_len / max(len(all_ref), 1)
     avg_hyp   = total_hyp_len / max(len(all_hyp), 1)
-    logger.info(f"  [Eval diag] blank_win_rate(global)={avg_blank*100:.1f}% | "
-                f"avg_ref_len={avg_ref:.1f} | avg_hyp_len={avg_hyp:.1f}")
+    logger.info(f"  [{label}] avg_ref_len={avg_ref:.1f} | avg_hyp_len={avg_hyp:.1f}")
 
     return compute_all_feature_metrics(all_ref, all_hyp)
 
@@ -200,7 +198,7 @@ def main():
     logger.info("Feature extractor loaded.")
 
     # ── Build datasets ────────────────────────────────────────────────────
-    train_ds, test_ds = get_datasets(
+    train_ds, scripted_test_ds, suitcase_test_ds = get_datasets_separate(
         l2arctic_root=args.data_dir,
         timit_root=args.timit_dir,
         max_duration=cfg["data"]["max_duration"],
@@ -218,8 +216,12 @@ def main():
         train_ds, batch_size=bs, shuffle=True,
         collate_fn=collate_fn, num_workers=num_workers, pin_memory=True,
     )
-    test_loader = DataLoader(
-        test_ds, batch_size=bs, shuffle=False,
+    scripted_loader = DataLoader(
+        scripted_test_ds, batch_size=bs, shuffle=False,
+        collate_fn=collate_fn, num_workers=num_workers,
+    )
+    suitcase_loader = DataLoader(
+        suitcase_test_ds, batch_size=bs, shuffle=False,
         collate_fn=collate_fn, num_workers=num_workers,
     )
 
@@ -267,6 +269,8 @@ def main():
 
     # ── Training loop ─────────────────────────────────────────────────────
     best_avg_acc = 0.0
+    patience     = cfg["training"].get("early_stopping_patience", 10)
+    no_improve   = 0
 
     for epoch in range(start_epoch, num_epochs + 1):
         logger.info(f"\n{'='*60}")
@@ -283,25 +287,50 @@ def main():
             f"time={time.time()-t0:.0f}s"
         )
 
-        logger.info("  Evaluating on test set...")
-        metrics = evaluate(model, test_loader, device)
-        acc = sum(m.accuracy for m in metrics) / len(metrics)
-        f1  = sum(m.f1       for m in metrics) / len(metrics)
-        logger.info(f"  Avg ACC={acc*100:.2f}% | F1={f1*100:.2f}%")
+        logger.info("  Evaluating on L2-Scripted...")
+        sc_metrics = evaluate(model, scripted_loader, device, "L2-Scripted")
+        sc_acc = sum(m.accuracy for m in sc_metrics) / len(sc_metrics)
+        sc_f1  = sum(m.f1       for m in sc_metrics) / len(sc_metrics)
+        logger.info(f"  [L2-Scripted] Avg ACC={sc_acc*100:.2f}% | F1={sc_f1*100:.2f}%")
 
-        if acc > best_avg_acc:
-            best_avg_acc = acc
-            best_path = Path(output_dir) / "best_model.pt"
+        logger.info("  Evaluating on L2-Suitcase...")
+        su_metrics = evaluate(model, suitcase_loader, device, "L2-Suitcase")
+        su_acc = sum(m.accuracy for m in su_metrics) / len(su_metrics)
+        su_f1  = sum(m.f1       for m in su_metrics) / len(su_metrics)
+        logger.info(f"  [L2-Suitcase] Avg ACC={su_acc*100:.2f}% | F1={su_f1*100:.2f}%")
+
+        # Model selection on scripted ACC (larger set, matches paper primary metric)
+        if sc_acc > best_avg_acc:
+            best_avg_acc = sc_acc
+            no_improve   = 0
+            best_path    = Path(output_dir) / "best_model.pt"
             torch.save(model.state_dict(), best_path)
-            logger.info(f"  ★ New best model (ACC={acc*100:.2f}%)")
+            logger.info(f"  ★ New best model (Scripted ACC={sc_acc*100:.2f}%)")
+        else:
+            no_improve += 1
+            logger.info(
+                f"  No improvement for {no_improve}/{patience} epochs "
+                f"(best Scripted ACC={best_avg_acc*100:.2f}%)"
+            )
+            if no_improve >= patience:
+                logger.info(f"  Early stopping at epoch {epoch}.")
+                if epoch % cfg["training"]["save_every"] == 0:
+                    save_checkpoint(model, optimizer, scheduler, epoch, train_loss, output_dir)
+                break
 
         if epoch % cfg["training"]["save_every"] == 0:
             save_checkpoint(model, optimizer, scheduler, epoch, train_loss, output_dir)
 
     # ── Final evaluation ──────────────────────────────────────────────────
     logger.info("\nFinal evaluation with best model...")
-    model.load_state_dict(torch.load(Path(output_dir) / "best_model.pt"))
-    print_feature_metrics(evaluate(model, test_loader, device))
+    model.load_state_dict(torch.load(Path(output_dir) / "best_model.pt",
+                                     map_location=device))
+
+    logger.info("\n=== L2-SCRIPTED (Final) ===")
+    print_feature_metrics(evaluate(model, scripted_loader, device, "L2-Scripted"))
+
+    logger.info("\n=== L2-SUITCASE (Final) ===")
+    print_feature_metrics(evaluate(model, suitcase_loader, device, "L2-Suitcase"))
 
     logger.info("Training complete!")
 

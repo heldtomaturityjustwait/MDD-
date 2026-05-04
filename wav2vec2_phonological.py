@@ -81,7 +81,7 @@ class PhonologicalWav2Vec2(nn.Module):
         # within the first epoch. Initializing the blank bias to -4.0 forces
         # the model to earn blank probability rather than defaulting to it.
         with torch.no_grad():
-            self.classifier.bias[self.blank_idx].fill_(-4.0)
+            self.classifier.bias[self.blank_idx].fill_(-2.5)
 
         print(f"[PhonologicalWav2Vec2] hidden_size={hidden_size}, "
               f"output_nodes={num_output_nodes}")
@@ -220,7 +220,7 @@ class PhonemeLevelWav2Vec2(nn.Module):
         # Initialize blank bias (index 39) to -4.0 to prevent the model
         # from defaulting to all-blank predictions early in training.
         with torch.no_grad():
-            self.classifier.bias[self.blank_idx].fill_(-4.0)
+            self.classifier.bias[self.blank_idx].fill_(-1)
 
     def forward(self, input_values, attention_mask=None):
         outputs = self.wav2vec2(
