@@ -4,8 +4,10 @@ mdd_evaluation.py
 Mispronunciation Detection and Diagnosis (MDD) evaluation.
 
 Supports two evaluation levels:
-  1. Phoneme-level MDD      -- using fine-tuned Whisper
-  2. Phonological-level MDD -- using wav2vec2 SCTC-SB (71-node output)
+  1. Phoneme-level MDD      -- PhonemeLevelWav2Vec2 (39 phonemes + blank, CTC)
+  2. Phonological-level MDD -- PhonologicalWav2Vec2 SCTC-SB (71-node output)
+
+Both models share the same Wav2Vec2FeatureExtractor.
 
 Metrics:
   FAR = FA / (FA + TR)     False Acceptance Rate
@@ -22,19 +24,25 @@ MDD categories (per canonical position):
 The three sequences used for evaluation
 -----------------------------------------
   canonical
-      From transcript/<utt_id>.txt → text_to_phones (CMUdict).
-      The sentence the learner was supposed to pronounce.
+      Derived directly from annotation/<utt_id>.TextGrid:
+      the canonical field of each interval (first element of comma-separated label
+      for error intervals; the label itself for correct intervals).
 
   human-annotated
-      What the speaker actually produced:
-        1. annotation/<utt_id>.TextGrid  (if it exists) → parse_textgrid_annotation
-           → actual_phones  (substitutions/deletions/insertions reflected)
-        2. textgrid/<utt_id>.TextGrid  (fallback, no error labels)
-           → parse_textgrid_canonical  (treated as all correct)
+      Derived directly from the same annotation TextGrid:
+      what the speaker actually produced (substituted phones used, deletions
+      omitted, insertions included).
 
   predicted
-      Whisper: output phoneme list  (list[str])
-      wav2vec2 SCTC-SB: raw logits  (T, 71) numpy array
+      Phoneme-level : PhonemeLevelWav2Vec2 logits (T, 40) → greedy CTC decode
+                      → list[str] of CMU-39 phonemes
+      Phonological  : PhonologicalWav2Vec2 logits (T, 71) numpy array
+
+Source of truth
+---------------
+Both canonical and human sequences come from annotation/<utt_id>.TextGrid only.
+Utterances with no annotation file are SKIPPED entirely — there is no fallback to
+transcript or textgrid directories.
 
 Alignment
 ---------
@@ -59,6 +67,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -74,78 +83,121 @@ from phonological_features import (
     feature_idx_to_pos_node,
     feature_idx_to_neg_node,
 )
-from dataset import (
-    normalize_phoneme,
-    text_to_phones,
-    parse_textgrid_annotation,
-    parse_textgrid_canonical,
-)
+from dataset import normalize_phoneme
 
 logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sequence derivation
+# Annotation TextGrid parser — derives BOTH canonical and human sequences
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_canonical_phones(transcript_path: str) -> list[str]:
+def parse_annotation_for_mdd(textgrid_path: str) -> tuple[list[str], list[str]]:
     """
-    Derive canonical phoneme sequence from a plain-text transcript file.
+    Parse an L2-ARCTIC annotation TextGrid and return both the canonical
+    phoneme sequence and the human-annotated (actually spoken) phoneme sequence.
 
-    Reads the sentence from transcript/<utt_id>.txt and converts it to
-    phonemes via CMUdict (text_to_phones). This is the intended pronunciation
-    and the anchor for all MDD evaluation.
+    This is the single source of truth for MDD evaluation. No transcript files
+    or force-aligned textgrid files are used.
 
-    Args:
-        transcript_path : path to <speaker>/transcript/<utt_id>.txt
+    TextGrid phones tier label formats
+    -----------------------------------
+      Correct:      "AH1"           canonical = ah,  human = ah
+      Substitution: "DH,D,s"        canonical = dh,  human = d   (what was said)
+      Deletion:     "TH,sil,d"      canonical = th,  human = —   (speaker omitted it)
+      Addition:     "sil,AH,a"      canonical = —,   human = ah  (extra; no canonical slot)
+      Hard error:   "CPL,err,s"     canonical = cpl, human = —   (uninterpretable; skip human)
+      Silence:      ""/"sil"/"sp"   skip entirely
 
-    Returns:
-        List of normalised CMU-39 phoneme strings, silences removed.
+    Canonical sequence contains the phoneme that was *intended* at each
+    slot (Correct and Substitution and Deletion intervals). Insertions/Additions
+    have no canonical slot and are excluded from the canonical sequence but
+    their pronounced phoneme is appended to the human sequence at the
+    corresponding position.
+
+    Returns
+    -------
+    canonical : list[str]   normalised CMU-39 phonemes, silences removed
+    human     : list[str]   normalised CMU-39 phonemes, silences removed
     """
-    path = Path(transcript_path)
+    path = Path(textgrid_path)
     if not path.exists():
-        logger.warning(f"Transcript not found: {transcript_path}")
-        return []
-    text = path.read_text(encoding="utf-8").strip()
-    phones = text_to_phones(text)
-    return [p for p in phones if p != "sil"]
+        return [], []
 
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
 
-def get_human_phones(ann_tg_path: str, canon_tg_path: str) -> list[str]:
-    """
-    Derive the human-annotated phoneme sequence (what the speaker actually said).
+    # Locate the phones tier
+    tier_blocks = re.split(r'item\s*\[\d+\]', content)
+    phones_block = None
+    for block in tier_blocks:
+        if re.search(r'name\s*=\s*"phones?"', block, re.IGNORECASE):
+            phones_block = block
+            break
+    if phones_block is None:
+        return [], []
 
-    Priority:
-      1. annotation/<utt_id>.TextGrid (if it exists):
-         parse_textgrid_annotation → actual_phones
-         Reflects real pronunciation: substituted phones used, deletions omitted,
-         insertions included.
-      2. textgrid/<utt_id>.TextGrid (fallback, no error labels):
-         parse_textgrid_canonical → all phonemes treated as correct
-         (human == canonical assumed for unannotated utterances).
+    intervals = re.findall(
+        r'intervals\s*\[\d+\].*?xmin\s*=\s*[\d.]+.*?xmax\s*=\s*[\d.]+'
+        r'.*?text\s*=\s*"([^"]*)"',
+        phones_block, re.DOTALL,
+    )
 
-    Args:
-        ann_tg_path   : path to <speaker>/annotation/<utt_id>.TextGrid
-        canon_tg_path : path to <speaker>/textgrid/<utt_id>.TextGrid  (fallback)
+    canonical_phones: list[str] = []
+    human_phones:     list[str] = []
 
-    Returns:
-        List of normalised CMU-39 phoneme strings, silences removed.
-    """
-    if Path(ann_tg_path).exists():
-        actual_phones, _, _ = parse_textgrid_annotation(ann_tg_path)
-        actual_phones = [p for p in actual_phones if p != "sil"]
-        if actual_phones:
-            return actual_phones
+    for text in intervals:
+        text = text.strip()
+        if text in ("", "sil", "sp", "spn", "<unk>"):
+            continue
 
-    if Path(canon_tg_path).exists():
-        logger.debug(
-            f"No annotation at {ann_tg_path}; "
-            f"using canonical TextGrid as human reference (all correct assumed)."
-        )
-        phones = parse_textgrid_canonical(canon_tg_path)
-        return [p for p in phones if p != "sil"]
+        parts = [p.strip() for p in text.split(",")]
 
-    return []
+        if len(parts) == 1:
+            # Correct pronunciation — same phoneme in both sequences
+            ph = normalize_phoneme(parts[0])
+            if ph != "sil":
+                canonical_phones.append(ph)
+                human_phones.append(ph)
+
+        elif len(parts) == 3:
+            canonical_raw, pronounced_raw, error_type = parts
+            error_type = error_type.strip().lower()
+
+            if error_type == "s":
+                # Substitution — canonical slot exists; speaker said something different
+                canon_ph = normalize_phoneme(canonical_raw)
+                if canon_ph != "sil":
+                    canonical_phones.append(canon_ph)
+
+                pronounced_clean = pronounced_raw.replace("*", "").strip()
+                if pronounced_clean.lower() == "err":
+                    # Uninterpretable — treat as deletion on the human side
+                    pass
+                else:
+                    human_ph = normalize_phoneme(pronounced_clean)
+                    if human_ph != "sil":
+                        human_phones.append(human_ph)
+
+            elif error_type == "d":
+                # Deletion — canonical slot exists; speaker produced nothing
+                canon_ph = normalize_phoneme(canonical_raw)
+                if canon_ph != "sil":
+                    canonical_phones.append(canon_ph)
+                # human_phones: nothing added (deletion)
+
+            elif error_type == "a":
+                # Addition/Insertion — no canonical slot; speaker produced extra phoneme
+                # The canonical sequence gains nothing; human sequence gains the extra phone.
+                pronounced_clean = pronounced_raw.replace("*", "").strip()
+                human_ph = normalize_phoneme(pronounced_clean)
+                if human_ph != "sil":
+                    human_phones.append(human_ph)
+                # canonical_phones: nothing added
+
+        # Intervals with other formats are silently skipped
+
+    return canonical_phones, human_phones
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,8 +316,8 @@ def count_phoneme_mdd(
     phoneme string, so they are automatically treated as wrong.
 
     Args:
-        canonical : canonical phoneme sequence from CMUdict (anchor)
-        human     : human-annotated phoneme sequence
+        canonical : canonical phoneme sequence (anchor), from annotation TextGrid
+        human     : human-annotated phoneme sequence, from annotation TextGrid
         predicted : Whisper-predicted phoneme sequence
 
     Returns:
@@ -392,7 +444,6 @@ def _align_binary_sequence_to_canonical(ref_seq: list[int], hyp_seq: list[int]) 
     because they do not correspond to a canonical phoneme position. Deletions are
     represented as None.
     """
-    # local import avoids adding a new top-level dependency cycle
     from alignment import levenshtein_alignment
 
     _, _, _, ops = levenshtein_alignment(ref_seq, hyp_seq)
@@ -489,12 +540,9 @@ class MDDEvaluator:
     -------------
         evaluator = MDDEvaluator()
 
-        for utt_id, speaker in test_set:
-            canonical = get_canonical_phones(f"{root}/{speaker}/transcript/{utt_id}.txt")
-            human     = get_human_phones(
-                ann_tg_path   = f"{root}/{speaker}/annotation/{utt_id}.TextGrid",
-                canon_tg_path = f"{root}/{speaker}/textgrid/{utt_id}.TextGrid",
-            )
+        for ann_file in annotation_dir.glob("*.TextGrid"):
+            canonical, human = parse_annotation_for_mdd(str(ann_file))
+            utt_id = ann_file.stem
 
             # Phoneme-level (Whisper)
             whisper_phones = _run_whisper(whisper_model, processor, waveform, device)
@@ -573,7 +621,7 @@ class MDDEvaluator:
         if self.n_phoneme_utts > 0:
             p = results["phoneme_level"]
             print(f"\n{'─'*70}")
-            print(f"  PHONEME-LEVEL  (Whisper)  --  {self.n_phoneme_utts} utterances")
+            print(f"  PHONEME-LEVEL  (wav2vec2 CTC)  --  {self.n_phoneme_utts} utterances")
             print(f"{'─'*70}")
             print(f"  TA={p['TA']}  FA={p['FA']}  FR={p['FR']}  "
                   f"TR={p['TR']}  (CD={p['TR_CD']}, DE={p['TR_DE']})")
@@ -616,32 +664,73 @@ class MDDEvaluator:
 # Model inference helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_whisper(model, processor, waveform, device: str) -> list[str]:
-    """
-    Run fine-tuned Whisper → predicted phoneme list.
+# Phoneme index → string mapping for PhonemeLevelWav2Vec2 CTC decoding.
+# Imported directly from phonological_features so this always stays in sync
+# with the label vocabulary used during training.
+# CMU_39_PHONEMES has 39 entries (indices 0-38); index 39 = blank.
+# "sil" is the last entry (index 38) and is filtered out after decoding.
+from phonological_features import CMU_39_PHONEMES as _PHONEME_IDX_TO_STR
 
-    Expects Whisper to output space-separated ARPAbet tokens (e.g. "AH0 D V AY1 S").
-    Returns normalised CMU-39 phoneme strings, silences removed.
+
+def _run_phoneme_wav2vec2(
+    model,
+    feature_extractor,
+    waveform,
+    device: str,
+    blank_idx: int = 39,
+) -> list[str]:
+    """
+    Run PhonemeLevelWav2Vec2 → predicted phoneme sequence.
+
+    Greedy CTC decoding on the (T, 40) logits:
+      1. argmax over vocab at each frame
+      2. collapse consecutive repeated tokens
+      3. remove blank (index 39)
+      4. map remaining indices to CMU-39 phoneme strings
+
+    Args:
+        model             : PhonemeLevelWav2Vec2 (eval mode, on device)
+        feature_extractor : Wav2Vec2FeatureExtractor
+        waveform          : 1-D float tensor, 16 kHz mono
+        device            : "cuda" or "cpu"
+        blank_idx         : CTC blank index (default 39)
+
+    Returns:
+        List of normalised CMU-39 phoneme strings, silences removed.
     """
     import torch
-    inputs = processor(
-        waveform.numpy(), sampling_rate=16000, return_tensors="pt"
+    inputs = feature_extractor(
+        waveform.numpy(), sampling_rate=16000, return_tensors="pt", padding=True
     )
     with torch.no_grad():
-        generated = model.generate(inputs.input_features.to(device))
-    tokens = processor.batch_decode(generated, skip_special_tokens=True)
-    if not tokens:
-        return []
-    phones = [normalize_phoneme(p) for p in tokens[0].strip().split()]
-    return [p for p in phones if p != "sil"]
+        logits, _ = model(inputs.input_values.to(device))  # (1, T, 40)
+
+    logit_ids = logits.squeeze(0).argmax(dim=-1).tolist()  # greedy: list[int]
+
+    # CTC collapse: remove blanks and consecutive repeats
+    phones: list[str] = []
+    prev = None
+    for idx in logit_ids:
+        if idx == blank_idx:
+            prev = None
+            continue
+        if idx != prev:
+            ph = _PHONEME_IDX_TO_STR[idx] if idx < len(_PHONEME_IDX_TO_STR) else "sil"
+            if ph != "sil":
+                phones.append(ph)
+            prev = idx
+
+    return phones
 
 
-def _run_sctcSB(model, feature_extractor, waveform, device: str) -> np.ndarray:
+def _run_phonological_wav2vec2(
+    model,
+    feature_extractor,
+    waveform,
+    device: str,
+) -> np.ndarray:
     """
-    Run SCTC-SB wav2vec2 → raw logits (T, 71) as a numpy array.
-
-    Supports PhonologicalWav2Vec2 (returns tuple) and HuggingFace-style
-    models (expose a .logits attribute).
+    Run PhonologicalWav2Vec2 (SCTC-SB) → raw logits (T, 71) as a numpy array.
     """
     import torch
     inputs = feature_extractor(
@@ -665,43 +754,38 @@ def _run_sctcSB(model, feature_extractor, waveform, device: str) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_mdd(
-    l2arctic_root:           str,
-    speakers:                list[str],
-    whisper_model            = None,
-    whisper_processor        = None,
-    sctcSB_model             = None,
-    sctcSB_feature_extractor = None,
-    device:      str           = "cuda",
+    l2arctic_root:        str,
+    speakers:             list[str],
+    phoneme_model         = None,
+    phonological_model    = None,
+    feature_extractor     = None,
+    device:      str        = "cuda",
     output_json: Optional[str] = None,
-    verbose:     bool          = True,
+    verbose:     bool       = True,
 ) -> dict:
     """
-    Run full MDD evaluation over L2-ARCTIC scripted utterances.
+    Run full MDD evaluation over L2-ARCTIC annotated utterances.
+
+    Only utterances that have a corresponding annotation/<utt_id>.TextGrid are
+    evaluated. Unannotated utterances are skipped — there is no fallback.
+
+    Both canonical and human-annotated sequences are derived directly from the
+    annotation TextGrid via parse_annotation_for_mdd().
 
     Directory structure assumed per speaker:
-        <speaker>/
-          wav/           ← .wav files
-          transcript/    ← <utt_id>.txt  (plain-text sentence for CMUdict)
-          annotation/    ← <utt_id>.TextGrid  (human error annotation, ~15% coverage)
-          textgrid/      ← <utt_id>.TextGrid  (force-aligned, all utterances, fallback)
-
-    For each utterance:
-      canonical  ← transcript/<utt>.txt  →  text_to_phones (CMUdict)
-      human      ← annotation/<utt>.TextGrid  OR  textgrid/<utt>.TextGrid fallback
-      predicted  ← Whisper output  and/or  SCTC-SB logits
-
-    Utterances with no canonical phones or no human phones are skipped.
+        <l2arctic_root>/<speaker>/
+          wav/          ← <utt_id>.wav  (audio files)
+          annotation/   ← <utt_id>.TextGrid  (human MDD annotations, ~150/speaker)
 
     Args:
-        l2arctic_root            : root path of the L2-ARCTIC corpus
-        speakers                 : list of speaker IDs to evaluate
-        whisper_model            : fine-tuned WhisperForConditionalGeneration (optional)
-        whisper_processor        : WhisperProcessor (optional)
-        sctcSB_model             : SCTC-SB PhonologicalWav2Vec2 model (optional)
-        sctcSB_feature_extractor : Wav2Vec2FeatureExtractor (optional)
-        device                   : "cuda" or "cpu"
-        output_json              : if set, save results to this path as JSON
-        verbose                  : log progress every 50 utterances
+        l2arctic_root      : root path of the L2-ARCTIC corpus
+        speakers           : list of speaker IDs to evaluate
+        phoneme_model      : PhonemeLevelWav2Vec2 instance (optional)
+        phonological_model : PhonologicalWav2Vec2 instance (optional)
+        feature_extractor  : Wav2Vec2FeatureExtractor (shared by both models)
+        device             : "cuda" or "cpu"
+        output_json        : if set, save results to this path as JSON
+        verbose            : log progress every 50 utterances
 
     Returns:
         dict with keys: phoneme_level, phonological_level, counts
@@ -712,78 +796,84 @@ def evaluate_mdd(
     evaluator = MDDEvaluator()
     root      = Path(l2arctic_root)
 
-    if whisper_model is not None:
-        whisper_model.to(device).eval()
-    if sctcSB_model is not None:
-        sctcSB_model.to(device).eval()
+    if phoneme_model is not None:
+        phoneme_model.to(device).eval()
+    if phonological_model is not None:
+        phonological_model.to(device).eval()
 
     n_total = n_skipped = 0
 
     for spk in speakers:
-        spk_dir = root / spk
-        wav_dir = spk_dir / "wav"
-        trs_dir = spk_dir / "transcript"
-        ann_dir = spk_dir / "annotation"
-        tg_dir  = spk_dir / "textgrid"
+        spk_dir  = root / spk
+        wav_dir  = spk_dir / "wav"
+        ann_dir  = spk_dir / "annotation"
 
         if not wav_dir.exists():
             logger.warning(f"wav dir not found for speaker {spk}, skipping")
             continue
+        if not ann_dir.exists():
+            logger.warning(f"annotation dir not found for speaker {spk}, skipping")
+            continue
 
-        wav_files = sorted(wav_dir.glob("*.wav"))
-        for wav_idx, wav_file in enumerate(wav_files):
-            utt_id = wav_file.stem
+        # Drive the loop from annotation files — only annotated utterances
+        ann_files = sorted(ann_dir.glob("*.TextGrid"))
+        if not ann_files:
+            logger.warning(f"No annotation TextGrids found for speaker {spk}, skipping")
+            continue
+
+        for ann_idx, ann_file in enumerate(ann_files):
+            utt_id   = ann_file.stem
+            wav_file = wav_dir / f"{utt_id}.wav"
             n_total += 1
 
-            if verbose and wav_idx % 50 == 0:
-                print(f"  [{spk}] {wav_idx + 1}/{len(wav_files)}  {utt_id}")
+            if verbose and ann_idx % 50 == 0:
+                print(f"  [{spk}] {ann_idx + 1}/{len(ann_files)}  {utt_id}")
 
-            # ── 1. Canonical: transcript → CMUdict ────────────────────────
-            canonical = get_canonical_phones(str(trs_dir / f"{utt_id}.txt"))
+            # ── 1. Canonical + Human: both from annotation TextGrid ───────
+            canonical, human = parse_annotation_for_mdd(str(ann_file))
             if not canonical:
-                logger.warning(f"[{utt_id}] no canonical phones, skipping")
+                logger.warning(f"[{utt_id}] no canonical phones from annotation, skipping")
                 n_skipped += 1
                 continue
-
-            # ── 2. Human: annotation TextGrid → textgrid fallback ─────────
-            human = get_human_phones(
-                ann_tg_path   = str(ann_dir / f"{utt_id}.TextGrid"),
-                canon_tg_path = str(tg_dir  / f"{utt_id}.TextGrid"),
-            )
             if not human:
-                logger.warning(f"[{utt_id}] no human phones, skipping")
+                logger.warning(f"[{utt_id}] no human phones from annotation, skipping")
                 n_skipped += 1
                 continue
 
-            # ── 3. Load audio ──────────────────────────────────────────────
+            # ── 2. Load audio ─────────────────────────────────────────────
+            if not wav_file.exists():
+                logger.warning(f"[{utt_id}] wav file not found: {wav_file}, skipping")
+                n_skipped += 1
+                continue
+
             waveform, sr = torchaudio.load(str(wav_file))
             if sr != 16000:
                 waveform = torchaudio.functional.resample(waveform, sr, 16000)
             waveform = waveform.mean(dim=0)   # mono (T,)
 
-            # ── 4. Phoneme-level MDD (Whisper) ─────────────────────────────
-            if whisper_model is not None and whisper_processor is not None:
+            # ── 3. Phoneme-level MDD (PhonemeLevelWav2Vec2 CTC) ──────────
+            if phoneme_model is not None and feature_extractor is not None:
                 try:
-                    predicted_phones = _run_whisper(
-                        whisper_model, whisper_processor, waveform, device
+                    predicted_phones = _run_phoneme_wav2vec2(
+                        phoneme_model, feature_extractor, waveform, device
                     )
                     evaluator.add_phoneme_utterance(
                         canonical, human, predicted_phones, utt_id
                     )
                 except Exception as e:
-                    logger.warning(f"[{utt_id}] Whisper inference error: {e}")
+                    logger.warning(f"[{utt_id}] phoneme model inference error: {e}")
 
-            # ── 5. Phonological-level MDD (SCTC-SB wav2vec2) ───────────────
-            if sctcSB_model is not None and sctcSB_feature_extractor is not None:
+            # ── 4. Phonological-level MDD (PhonologicalWav2Vec2 SCTC-SB) ─
+            if phonological_model is not None and feature_extractor is not None:
                 try:
-                    logits = _run_sctcSB(
-                        sctcSB_model, sctcSB_feature_extractor, waveform, device
+                    logits = _run_phonological_wav2vec2(
+                        phonological_model, feature_extractor, waveform, device
                     )
                     evaluator.add_phonological_utterance(
                         canonical, human, logits, utt_id
                     )
                 except Exception as e:
-                    logger.warning(f"[{utt_id}] SCTC-SB inference error: {e}")
+                    logger.warning(f"[{utt_id}] phonological model inference error: {e}")
 
     print(f"\n[evaluate_mdd] total={n_total}  skipped={n_skipped}  "
           f"evaluated={n_total - n_skipped}")
@@ -804,18 +894,21 @@ if __name__ == "__main__":
     import sys
 
     parser = argparse.ArgumentParser(
-        description="MDD evaluation for phoneme-level (Whisper) and/or "
-                    "phonological-level (SCTC-SB wav2vec2) models."
+        description="MDD evaluation for phoneme-level (PhonemeLevelWav2Vec2 CTC) "
+                    "and/or phonological-level (PhonologicalWav2Vec2 SCTC-SB) models."
     )
-    parser.add_argument("--l2arctic_dir",  type=str, default=None)
-    parser.add_argument("--sctcSB_model",  type=str, default=None,
-                        help="Path to SCTC-SB checkpoint (.pt)")
-    parser.add_argument("--whisper_model", type=str, default=None,
-                        help="Path to fine-tuned Whisper checkpoint directory")
-    parser.add_argument("--speakers",      type=str, nargs="+", default=None)
-    parser.add_argument("--output_json",   type=str, default=None)
-    parser.add_argument("--device",        type=str, default="cuda")
-    parser.add_argument("--sanity_check",  action="store_true")
+    parser.add_argument("--l2arctic_dir",        type=str, default=None)
+    parser.add_argument("--phoneme_model",        type=str, default=None,
+                        help="Path to PhonemeLevelWav2Vec2 checkpoint (.pt)")
+    parser.add_argument("--phonological_model",   type=str, default=None,
+                        help="Path to PhonologicalWav2Vec2 checkpoint (.pt)")
+    parser.add_argument("--feature_extractor",    type=str,
+                        default="facebook/wav2vec2-large-robust",
+                        help="HuggingFace model name for Wav2Vec2FeatureExtractor")
+    parser.add_argument("--speakers",             type=str, nargs="+", default=None)
+    parser.add_argument("--output_json",          type=str, default=None)
+    parser.add_argument("--device",               type=str, default="cuda")
+    parser.add_argument("--sanity_check",         action="store_true")
     args = parser.parse_args()
 
     # ── Sanity check: reproduce Table 2 ──────────────────────────────────────
@@ -851,12 +944,10 @@ if __name__ == "__main__":
                     logits[t, neg] =  1.0
         return logits
 
-    # Simulate wav2vec2 predicting ["ae","d","f","ey","z"] — same as Whisper in Table 2
     pred_logits = _make_perfect_logits(["ae", "d", "f", "ey", "z"])
     phon_result = count_phonological_mdd(_canonical, _human, pred_logits)
     macro = phon_result.summary()["__macro_avg__"]
     print(f"  Macro FAR={macro['FAR']}  FRR={macro['FRR']}  DER={macro['DER']}")
-    # A perfect predictor has no diagnosis errors (DER == 0)
     assert macro["DER"] == 0.0, f"Expected DER=0.0, got {macro['DER']}"
     print("  PASSED\n")
 
@@ -866,53 +957,51 @@ if __name__ == "__main__":
     # ── Full corpus evaluation ────────────────────────────────────────────────
     if args.l2arctic_dir is None:
         parser.error("--l2arctic_dir is required for corpus evaluation.")
-    if args.sctcSB_model is None and args.whisper_model is None:
-        parser.error("Provide at least one of --sctcSB_model or --whisper_model.")
+    if args.phoneme_model is None and args.phonological_model is None:
+        parser.error("Provide at least one of --phoneme_model or --phonological_model.")
 
-    DEFAULT_TEST_SPEAKERS = ["RRBI", "YBAA", "HJK", "BWC", "EBVS", "YDCK"]
+    import torch
+    from transformers import Wav2Vec2FeatureExtractor
+
+    # L2-ARCTIC scripted test speakers (Ye et al. 2022 / Shahin et al. 2025)
+    DEFAULT_TEST_SPEAKERS = ["ASI", "YBAA", "HJK", "BWC", "EBVS", "YDCK"]
     speakers = args.speakers if args.speakers else DEFAULT_TEST_SPEAKERS
     print(f"Evaluating speakers: {speakers}")
     print(f"Device: {args.device}\n")
 
-    sctcSB_model             = None
-    sctcSB_feature_extractor = None
-    whisper_model            = None
-    whisper_processor        = None
+    feature_extractor  = Wav2Vec2FeatureExtractor.from_pretrained(args.feature_extractor)
+    phoneme_model      = None
+    phonological_model = None
 
-    if args.sctcSB_model:
-        import torch
-        from transformers import Wav2Vec2FeatureExtractor
-        from wav2vec2_phonological import PhonologicalWav2Vec2
-        print(f"[SCTC-SB] Loading checkpoint: {args.sctcSB_model}")
-        sctcSB_model = PhonologicalWav2Vec2()
-        state = torch.load(args.sctcSB_model, map_location="cpu")
+    if args.phoneme_model:
+        from wav2vec2_phonological import PhonemeLevelWav2Vec2
+        print(f"[phoneme] Loading checkpoint: {args.phoneme_model}")
+        phoneme_model = PhonemeLevelWav2Vec2()
+        state = torch.load(args.phoneme_model, map_location="cpu")
         if isinstance(state, dict) and "model_state_dict" in state:
             state = state["model_state_dict"]
-        sctcSB_model.load_state_dict(state)
-        sctcSB_model.eval()
-        sctcSB_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-            "facebook/wav2vec2-large-robust"
-        )
-        print("[SCTC-SB] Ready.")
+        phoneme_model.load_state_dict(state)
+        phoneme_model.eval()
+        print("[phoneme] Ready.")
 
-    if args.whisper_model:
-        from transformers import WhisperForConditionalGeneration, WhisperProcessor
-        print(f"[Whisper] Loading checkpoint: {args.whisper_model}")
-        whisper_model     = WhisperForConditionalGeneration.from_pretrained(
-            args.whisper_model
-        )
-        whisper_processor = WhisperProcessor.from_pretrained(args.whisper_model)
-        whisper_model.eval()
-        print("[Whisper] Ready.")
+    if args.phonological_model:
+        from wav2vec2_phonological import PhonologicalWav2Vec2
+        print(f"[phonological] Loading checkpoint: {args.phonological_model}")
+        phonological_model = PhonologicalWav2Vec2()
+        state = torch.load(args.phonological_model, map_location="cpu")
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
+        phonological_model.load_state_dict(state)
+        phonological_model.eval()
+        print("[phonological] Ready.")
 
     results = evaluate_mdd(
-        l2arctic_root            = args.l2arctic_dir,
-        speakers                 = speakers,
-        whisper_model            = whisper_model,
-        whisper_processor        = whisper_processor,
-        sctcSB_model             = sctcSB_model,
-        sctcSB_feature_extractor = sctcSB_feature_extractor,
-        device                   = args.device,
-        output_json              = args.output_json,
-        verbose                  = True,
+        l2arctic_root      = args.l2arctic_dir,
+        speakers           = speakers,
+        phoneme_model      = phoneme_model,
+        phonological_model = phonological_model,
+        feature_extractor  = feature_extractor,
+        device             = args.device,
+        output_json        = args.output_json,
+        verbose            = True,
     )
