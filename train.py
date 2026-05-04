@@ -31,7 +31,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from transformers import get_linear_schedule_with_warmup, Wav2Vec2Processor
+from transformers import get_linear_schedule_with_warmup, Wav2Vec2FeatureExtractor
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -75,7 +75,7 @@ def train_epoch(
     optimizer.zero_grad()
 
     for step, batch in enumerate(loader):
-        # processor already normalized and padded — just move to device
+        # feature extractor already normalized and padded — just move to device
         input_values   = batch["input_values"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         ctc_labels     = batch["ctc_labels"]
@@ -188,14 +188,16 @@ def main():
     if device.type == "cuda":
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    # ── Processor ─────────────────────────────────────────────────────────
-    # Wav2Vec2Processor handles normalization (zero-mean, unit-variance) and
-    # padding. Must be loaded from the SAME pretrained model as the backbone
-    # so that preprocessing matches what the model was pretrained on.
+    # ── Feature Extractor ─────────────────────────────────────────────────
+    # Wav2Vec2FeatureExtractor handles normalization (zero-mean, unit-variance)
+    # and padding. We use the feature extractor directly rather than
+    # Wav2Vec2Processor because wav2vec2-large-robust does not ship a tokenizer
+    # (it was released as a feature extractor only, not a full ASR processor).
+    # The feature extractor is all we need — we don't decode to text.
     pretrained_name = cfg["model"]["pretrained_model_name"]
-    logger.info(f"Loading processor from '{pretrained_name}' ...")
-    processor = Wav2Vec2Processor.from_pretrained(pretrained_name)
-    logger.info("Processor loaded.")
+    logger.info(f"Loading feature extractor from '{pretrained_name}' ...")
+    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(pretrained_name)
+    logger.info("Feature extractor loaded.")
 
     # ── Build datasets ────────────────────────────────────────────────────
     train_ds, test_ds = get_datasets(
@@ -209,8 +211,8 @@ def main():
     bs          = cfg["training"]["batch_size"]
     num_workers = cfg["data"].get("num_workers", 4)
 
-    # make_collate_fn binds the processor into the collate function
-    collate_fn = make_collate_fn(processor)
+    # make_collate_fn binds the feature extractor into the collate function
+    collate_fn = make_collate_fn(feature_extractor)
 
     train_loader = DataLoader(
         train_ds, batch_size=bs, shuffle=True,
