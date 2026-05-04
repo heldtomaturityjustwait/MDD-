@@ -217,10 +217,10 @@ class PhonemeLevelWav2Vec2(nn.Module):
 
         # ── Blank node bias initialization ────────────────────────────────
         # Same CTC blank collapse problem as the phonological model.
-        # Initialize blank bias (index 39) to -4.0 to prevent the model
+        # Initialize blank bias (index 39) to -0.75 to prevent the model
         # from defaulting to all-blank predictions early in training.
         with torch.no_grad():
-            self.classifier.bias[self.blank_idx].fill_(-1)
+            self.classifier.bias[self.blank_idx].fill_(-0.75)
 
     def forward(self, input_values, attention_mask=None):
         outputs = self.wav2vec2(
