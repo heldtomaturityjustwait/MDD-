@@ -48,7 +48,7 @@ from phonological_features import (
 # ─────────────────────────────────────────────────────────────────────────────
 # Speaker splits (Ye et al. 2022 / Shahin et al. 2025)
 # ─────────────────────────────────────────────────────────────────────────────
-SCRIPTED_TEST_SPEAKERS  = {"ASI", "YBAA", "HJK", "BWC", "EBVS", "YDCK"}
+SCRIPTED_TEST_SPEAKERS  = {"RRBI", "YBAA", "HJK", "BWC", "EBVS", "YDCK"}
 SUITCASE_TEST_SPEAKERS  = {"RRBI", "YBAA", "HJK", "BWC", "EBVS", "YDCK"}
 
 # TIMIT phone labels that need remapping to the CMU 39-phoneme set
