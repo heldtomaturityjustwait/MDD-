@@ -269,8 +269,6 @@ def main():
 
     # ── Training loop ─────────────────────────────────────────────────────
     best_avg_acc = 0.0
-    patience     = cfg["training"].get("early_stopping_patience", 10)
-    no_improve   = 0
 
     for epoch in range(start_epoch, num_epochs + 1):
         logger.info(f"\n{'='*60}")
@@ -302,21 +300,14 @@ def main():
         # Model selection on scripted ACC (larger set, matches paper primary metric)
         if sc_acc > best_avg_acc:
             best_avg_acc = sc_acc
-            no_improve   = 0
             best_path    = Path(output_dir) / "best_model.pt"
             torch.save(model.state_dict(), best_path)
             logger.info(f"  ★ New best model (Scripted ACC={sc_acc*100:.2f}%)")
         else:
-            no_improve += 1
             logger.info(
-                f"  No improvement for {no_improve}/{patience} epochs "
+                f"  No improvement this epoch "
                 f"(best Scripted ACC={best_avg_acc*100:.2f}%)"
             )
-            if no_improve >= patience:
-                logger.info(f"  Early stopping at epoch {epoch}.")
-                if epoch % cfg["training"]["save_every"] == 0:
-                    save_checkpoint(model, optimizer, scheduler, epoch, train_loss, output_dir)
-                break
 
         if epoch % cfg["training"]["save_every"] == 0:
             save_checkpoint(model, optimizer, scheduler, epoch, train_loss, output_dir)
