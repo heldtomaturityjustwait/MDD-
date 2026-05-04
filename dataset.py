@@ -619,24 +619,62 @@ class SuitcaseDataset(Dataset):
 # collate_fn
 # ─────────────────────────────────────────────────────────────────────────────
 
-def collate_fn(batch: list[dict]) -> dict:
-    """Pad waveforms; keep CTC labels as nested lists (used by SCTC-SB loss)."""
-    batch = sorted(batch, key=lambda x: x["waveform"].shape[0], reverse=True)
+def make_collate_fn(processor):
+    """
+    Factory that returns a collate_fn with a Wav2Vec2Processor bound to it.
 
-    lengths = torch.tensor([b["waveform"].shape[0] for b in batch], dtype=torch.long)
-    max_len = lengths.max().item()
-    padded  = torch.zeros(len(batch), max_len)
-    for i, b in enumerate(batch):
-        padded[i, :b["waveform"].shape[0]] = b["waveform"]
+    The processor handles two things that we previously did manually:
+      1. Normalization — zero-mean, unit-variance per waveform
+         (required because wav2vec2 was pretrained on normalized audio)
+      2. Padding + attention_mask — pads all waveforms in the batch to
+         the same length and returns a boolean mask
 
-    return {
-        "input_values":  padded,                                 # (B, T)
-        "input_lengths": lengths,                                # (B,)
-        "ctc_labels":    [b["ctc_labels"]    for b in batch],   # [B][35][U]
-        "actual_phones": [b["actual_phones"] for b in batch],   # [B][list[str]]
-        "speaker":       [b["speaker"]       for b in batch],
-        "utt_id":        [b["utt_id"]        for b in batch],
-    }
+    Args:
+        processor: Wav2Vec2Processor loaded from the same pretrained model
+
+    Returns:
+        collate_fn(batch) → dict with keys:
+            input_values   : (B, T)       normalized + padded waveforms
+            attention_mask : (B, T)       1 = real audio, 0 = padding
+            input_lengths  : (B,)         actual sample lengths (for reference)
+            ctc_labels     : [B][35][U]   CTC label sequences
+            actual_phones  : [B][list[str]]
+            speaker        : [B][str]
+            utt_id         : [B][str]
+    """
+    def collate_fn(batch: list[dict]) -> dict:
+        # Sort longest-first (standard for CTC batching efficiency)
+        batch = sorted(batch, key=lambda x: x["waveform"].shape[0], reverse=True)
+
+        # Raw waveforms as numpy arrays — processor expects list of 1-D arrays
+        raw_waveforms = [b["waveform"].numpy() for b in batch]
+        input_lengths = torch.tensor(
+            [b["waveform"].shape[0] for b in batch], dtype=torch.long
+        )
+
+        # Wav2Vec2Processor normalizes each waveform independently
+        # (zero-mean, unit-variance) and pads to the longest in the batch.
+        # return_tensors="pt" gives us PyTorch tensors directly.
+        processed = processor(
+            raw_waveforms,
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True,          # pad shorter sequences to longest
+        )
+        # processed.input_values  : (B, T_max)  normalized + padded
+        # processed.attention_mask: (B, T_max)  1=real, 0=padding
+
+        return {
+            "input_values":   processed.input_values,    # (B, T)
+            "attention_mask": processed.attention_mask,  # (B, T)
+            "input_lengths":  input_lengths,             # (B,) raw sample counts
+            "ctc_labels":     [b["ctc_labels"]    for b in batch],
+            "actual_phones":  [b["actual_phones"] for b in batch],
+            "speaker":        [b["speaker"]       for b in batch],
+            "utt_id":         [b["utt_id"]        for b in batch],
+        }
+
+    return collate_fn
 
 
 # ─────────────────────────────────────────────────────────────────────────────

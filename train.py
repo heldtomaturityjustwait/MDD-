@@ -31,11 +31,11 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup, Wav2Vec2Processor
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from dataset import get_datasets, collate_fn
+from dataset import get_datasets, make_collate_fn
 from phonological_features import (
     phoneme_sequence_to_feature_sequences,
     NUM_FEATURES,
@@ -61,16 +61,6 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def build_attention_mask(
-    input_values: torch.Tensor, lengths: torch.Tensor
-) -> torch.Tensor:
-    B, T = input_values.shape
-    mask = torch.zeros(B, T, dtype=torch.long, device=input_values.device)
-    for i, l in enumerate(lengths):
-        mask[i, :l] = 1
-    return mask
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Train / Eval
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,11 +75,11 @@ def train_epoch(
     optimizer.zero_grad()
 
     for step, batch in enumerate(loader):
-        input_values  = batch["input_values"].to(device)
-        input_lengths = batch["input_lengths"].to(device)
-        ctc_labels    = batch["ctc_labels"]
+        # processor already normalized and padded — just move to device
+        input_values   = batch["input_values"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        ctc_labels     = batch["ctc_labels"]
 
-        attention_mask = build_attention_mask(input_values, input_lengths)
         logits, output_lengths = model(input_values, attention_mask)
         logits_t       = logits.transpose(0, 1)           # (T, B, 71)
         output_lengths = output_lengths.clamp(max=logits_t.shape[0])
@@ -128,13 +118,15 @@ def evaluate(model, loader, device) -> list:
     total_ref_len = total_hyp_len = total_blank_frac = n_batches = 0
 
     for batch in loader:
-        input_values  = batch["input_values"].to(device)
-        input_lengths = batch["input_lengths"].to(device)
-        attention_mask = build_attention_mask(input_values, input_lengths)
+        input_values   = batch["input_values"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
 
         logits, _ = model(input_values, attention_mask)
 
-        # Diagnostic: how often does blank (node 70) win across all frames?
+        # Diagnostic: blank (node 70) win rate across all 71 nodes globally
+        # Note: this is the global argmax — not the local 3-node argmax used
+        # in decode(). A high rate here does not necessarily mean decode() is
+        # failing. Check avg_hyp_len to confirm decode() output.
         blank_wins = (logits.argmax(dim=-1) == 70).float().mean().item()
         total_blank_frac += blank_wins
         n_batches += 1
@@ -152,7 +144,7 @@ def evaluate(model, loader, device) -> list:
     avg_blank = total_blank_frac / max(n_batches, 1)
     avg_ref   = total_ref_len / max(len(all_ref), 1)
     avg_hyp   = total_hyp_len / max(len(all_hyp), 1)
-    logger.info(f"  [Eval diag] blank_win_rate={avg_blank*100:.1f}% | "
+    logger.info(f"  [Eval diag] blank_win_rate(global)={avg_blank*100:.1f}% | "
                 f"avg_ref_len={avg_ref:.1f} | avg_hyp_len={avg_hyp:.1f}")
 
     return compute_all_feature_metrics(all_ref, all_hyp)
@@ -196,6 +188,15 @@ def main():
     if device.type == "cuda":
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
 
+    # ── Processor ─────────────────────────────────────────────────────────
+    # Wav2Vec2Processor handles normalization (zero-mean, unit-variance) and
+    # padding. Must be loaded from the SAME pretrained model as the backbone
+    # so that preprocessing matches what the model was pretrained on.
+    pretrained_name = cfg["model"]["pretrained_model_name"]
+    logger.info(f"Loading processor from '{pretrained_name}' ...")
+    processor = Wav2Vec2Processor.from_pretrained(pretrained_name)
+    logger.info("Processor loaded.")
+
     # ── Build datasets ────────────────────────────────────────────────────
     train_ds, test_ds = get_datasets(
         l2arctic_root=args.data_dir,
@@ -208,6 +209,9 @@ def main():
     bs          = cfg["training"]["batch_size"]
     num_workers = cfg["data"].get("num_workers", 4)
 
+    # make_collate_fn binds the processor into the collate function
+    collate_fn = make_collate_fn(processor)
+
     train_loader = DataLoader(
         train_ds, batch_size=bs, shuffle=True,
         collate_fn=collate_fn, num_workers=num_workers, pin_memory=True,
@@ -219,7 +223,7 @@ def main():
 
     # ── Model ─────────────────────────────────────────────────────────────
     model = PhonologicalWav2Vec2(
-        pretrained_model_name=cfg["model"]["pretrained_model_name"],
+        pretrained_model_name=pretrained_name,
         num_output_nodes=cfg["model"]["num_output_nodes"],
         freeze_cnn_encoder=cfg["model"]["freeze_cnn_encoder"],
     ).to(device)

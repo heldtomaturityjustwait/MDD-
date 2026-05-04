@@ -56,6 +56,7 @@ class PhonologicalWav2Vec2(nn.Module):
         self.num_output_nodes = num_output_nodes
         self.num_features = NUM_FEATURES
         self.blank_idx = BLANK_IDX
+        
 
         # ── Load pre-trained wav2vec2 ─────────────────────────────────────
         print(f"[PhonologicalWav2Vec2] Loading '{pretrained_model_name}' ...")
@@ -73,6 +74,13 @@ class PhonologicalWav2Vec2(nn.Module):
         #  number of nodes equals to the number of target phonological-features"
         hidden_size = self.wav2vec2.config.hidden_size
         self.classifier = nn.Linear(hidden_size, num_output_nodes)
+        # Initialize blank node (index 70) bias to -4.0 to prevent CTC blank
+        # collapse at training start. The blank node receives gradient from all
+        # 35 category losses simultaneously (35x accumulation), so it dominates
+        # without this correction. Starting it negative forces the model to earn
+        # blank probability rather than defaulting to it.
+        with torch.no_grad():
+            self.classifier.bias[self.blank_idx].fill_(-4.0)
 
         print(f"[PhonologicalWav2Vec2] hidden_size={hidden_size}, "
               f"output_nodes={num_output_nodes}")
