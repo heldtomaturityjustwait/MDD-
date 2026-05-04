@@ -162,6 +162,17 @@ class PhonologicalWav2Vec2(nn.Module):
 
                 # Argmax: 0=+att, 1=-att, 2=blank
                 preds = cat_logits.argmax(dim=-1)  # (T,)
+                if b == 0 and feat_idx == 0:
+                    blank_frac = (preds == 2).float().mean().item()
+                    pos_frac   = (preds == 0).float().mean().item()
+                    neg_frac   = (preds == 1).float().mean().item()
+                    print(f"[decode diag] feat=0 sample=0 | "
+                        f"T={T} | "
+                        f"+att={pos_frac*100:.1f}% "
+                        f"-att={neg_frac*100:.1f}% "
+                        f"blank={blank_frac*100:.1f}%")
+                    print(f"[decode diag] cat_logits first 5 frames:\n{cat_logits[:5]}")
+                    print(f"[decode diag] preds first 20: {preds[:20].tolist()}")
 
                 # CTC collapse: remove blanks and repeated labels
                 collapsed = []
