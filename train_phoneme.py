@@ -69,11 +69,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup, Wav2Vec2FeatureExtractor
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from dataset import get_datasets, collate_fn
+from dataset import get_datasets, make_collate_fn
 from wav2vec2_phonological import PhonemeLevelWav2Vec2
 from phonological_features import (
     CMU_39_PHONEMES,
@@ -105,17 +105,6 @@ BLANK_IDX    = 39   # CTC blank = last node (index 39)
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-def build_attention_mask(
-    input_values: torch.Tensor,
-    lengths: torch.Tensor,
-) -> torch.Tensor:
-    B, T = input_values.shape
-    mask = torch.zeros(B, T, dtype=torch.long, device=input_values.device)
-    for i, l in enumerate(lengths):
-        mask[i, :l] = 1
-    return mask
-
 
 def load_config(config_path: str) -> dict:
     with open(config_path) as f:
@@ -210,9 +199,9 @@ def train_epoch(
     optimizer.zero_grad()
 
     for step, batch in enumerate(loader):
+        # feature extractor already normalized and padded — just move to device
         input_values   = batch["input_values"].to(device)
-        input_lengths  = batch["input_lengths"].to(device)
-        attention_mask = build_attention_mask(input_values, input_lengths)
+        attention_mask = batch["attention_mask"].to(device)
 
         logits, output_lengths = model(input_values, attention_mask)
         logits_t       = logits.transpose(0, 1)   # (T, B, 40)
@@ -298,8 +287,7 @@ def evaluate(
 
     for batch_idx, batch in enumerate(loader):
         input_values   = batch["input_values"].to(device)
-        input_lengths  = batch["input_lengths"].to(device)
-        attention_mask = build_attention_mask(input_values, input_lengths)
+        attention_mask = batch["attention_mask"].to(device)
 
         logits, _        = model(input_values, attention_mask)
         recognized_batch = ctc_decode(logits)
@@ -352,6 +340,14 @@ def main():
     if device.type == "cuda":
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
 
+    # ── Feature Extractor ─────────────────────────────────────────────────
+    # Handles normalization (zero-mean, unit-variance) and padding.
+    # Must match the pretrained model used as the backbone.
+    pretrained_name = cfg["model"]["pretrained_model_name"]
+    logger.info(f"Loading feature extractor from '{pretrained_name}' ...")
+    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(pretrained_name)
+    logger.info("Feature extractor loaded.")
+
     # ── Datasets — identical split to SCTC-SB model ──────────────────────
     train_ds, test_ds = get_datasets(
         l2arctic_root=args.data_dir,
@@ -362,6 +358,8 @@ def main():
 
     bs          = cfg["training"]["batch_size"]
     num_workers = cfg["data"].get("num_workers", 4)
+
+    collate_fn = make_collate_fn(feature_extractor)
 
     train_loader = DataLoader(
         train_ds, batch_size=bs, shuffle=True,
@@ -374,7 +372,7 @@ def main():
 
     # ── Model ─────────────────────────────────────────────────────────────
     model = PhonemeLevelWav2Vec2(
-        pretrained_model_name=cfg["model"]["pretrained_model_name"],
+        pretrained_model_name=pretrained_name,
         num_phonemes=NUM_PHONEMES,
         freeze_cnn_encoder=cfg["model"]["freeze_cnn_encoder"],
     ).to(device)

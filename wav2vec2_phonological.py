@@ -28,7 +28,7 @@ Output nodes:
 
 import torch
 import torch.nn as nn
-from transformers import Wav2Vec2Model, Wav2Vec2Config
+from transformers import Wav2Vec2Model
 from typing import Optional
 
 from phonological_features import NUM_FEATURES, NUM_OUTPUT_NODES, BLANK_IDX
@@ -56,7 +56,6 @@ class PhonologicalWav2Vec2(nn.Module):
         self.num_output_nodes = num_output_nodes
         self.num_features = NUM_FEATURES
         self.blank_idx = BLANK_IDX
-        
 
         # ── Load pre-trained wav2vec2 ─────────────────────────────────────
         print(f"[PhonologicalWav2Vec2] Loading '{pretrained_model_name}' ...")
@@ -74,11 +73,13 @@ class PhonologicalWav2Vec2(nn.Module):
         #  number of nodes equals to the number of target phonological-features"
         hidden_size = self.wav2vec2.config.hidden_size
         self.classifier = nn.Linear(hidden_size, num_output_nodes)
-        # Initialize blank node (index 70) bias to -4.0 to prevent CTC blank
-        # collapse at training start. The blank node receives gradient from all
-        # 35 category losses simultaneously (35x accumulation), so it dominates
-        # without this correction. Starting it negative forces the model to earn
-        # blank probability rather than defaulting to it.
+
+        # ── Blank node bias initialization ────────────────────────────────
+        # The shared blank node (index 70) appears in all 35 category losses,
+        # so it receives 35x more gradient than any feature node. Without
+        # correction, CTC collapses to predicting blank at every timestep
+        # within the first epoch. Initializing the blank bias to -4.0 forces
+        # the model to earn blank probability rather than defaulting to it.
         with torch.no_grad():
             self.classifier.bias[self.blank_idx].fill_(-4.0)
 
@@ -87,8 +88,8 @@ class PhonologicalWav2Vec2(nn.Module):
 
     def forward(
         self,
-        input_values: torch.Tensor,     # (B, T_audio)
-        attention_mask: Optional[torch.Tensor] = None,   # (B, T_audio)
+        input_values: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass.
@@ -97,20 +98,14 @@ class PhonologicalWav2Vec2(nn.Module):
             logits        : (B, T_frames, 71)  raw logits
             output_lengths: (B,)  number of valid frames per batch item
         """
-        # wav2vec2 forward
         outputs = self.wav2vec2(
             input_values=input_values,
             attention_mask=attention_mask,
             output_hidden_states=False,
         )
-        # hidden_states: (B, T_frames, hidden_size)
         hidden_states = outputs.last_hidden_state
-
-        # Linear projection: (B, T_frames, 71)
         logits = self.classifier(hidden_states)
 
-        # Compute output frame lengths from input audio lengths
-        # wav2vec2 CNN reduces T_audio by a fixed factor (~320 for base/large)
         if attention_mask is not None:
             output_lengths = self._get_feat_extract_output_lengths(
                 attention_mask.sum(dim=1)
@@ -125,10 +120,6 @@ class PhonologicalWav2Vec2(nn.Module):
     def _get_feat_extract_output_lengths(
         self, input_lengths: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute output frame lengths after wav2vec2 CNN feature extraction.
-        Uses the model's built-in method.
-        """
         return self.wav2vec2._get_feat_extract_output_lengths(input_lengths)
 
     @torch.no_grad()
@@ -147,7 +138,7 @@ class PhonologicalWav2Vec2(nn.Module):
 
         Returns:
             decoded: [B][35]  list of decoded label sequences
-                     Each label sequence contains +att(True) or -att(False) per phoneme
+                     Each label sequence contains +att(True) or -att(False)
         """
         if logits.dim() == 2:
             logits = logits.unsqueeze(0)
@@ -170,17 +161,6 @@ class PhonologicalWav2Vec2(nn.Module):
 
                 # Argmax: 0=+att, 1=-att, 2=blank
                 preds = cat_logits.argmax(dim=-1)  # (T,)
-                if b == 0 and feat_idx == 0:
-                    blank_frac = (preds == 2).float().mean().item()
-                    pos_frac   = (preds == 0).float().mean().item()
-                    neg_frac   = (preds == 1).float().mean().item()
-                    print(f"[decode diag] feat=0 sample=0 | "
-                        f"T={T} | "
-                        f"+att={pos_frac*100:.1f}% "
-                        f"-att={neg_frac*100:.1f}% "
-                        f"blank={blank_frac*100:.1f}%")
-                    print(f"[decode diag] cat_logits first 5 frames:\n{cat_logits[:5]}")
-                    print(f"[decode diag] preds first 20: {preds[:20].tolist()}")
 
                 # CTC collapse: remove blanks and repeated labels
                 collapsed = []
@@ -225,7 +205,7 @@ class PhonemeLevelWav2Vec2(nn.Module):
     ):
         super().__init__()
         self.num_phonemes = num_phonemes
-        self.blank_idx = num_phonemes   # last node
+        self.blank_idx = num_phonemes   # index 39 = blank
 
         self.wav2vec2 = Wav2Vec2Model.from_pretrained(pretrained_model_name)
         if freeze_cnn_encoder:
@@ -235,9 +215,18 @@ class PhonemeLevelWav2Vec2(nn.Module):
         # 40 nodes: 39 phonemes + 1 blank
         self.classifier = nn.Linear(hidden_size, num_phonemes + 1)
 
+        # ── Blank node bias initialization ────────────────────────────────
+        # Same CTC blank collapse problem as the phonological model.
+        # Initialize blank bias (index 39) to -4.0 to prevent the model
+        # from defaulting to all-blank predictions early in training.
+        with torch.no_grad():
+            self.classifier.bias[self.blank_idx].fill_(-4.0)
+
     def forward(self, input_values, attention_mask=None):
-        outputs = self.wav2vec2(input_values=input_values,
-                                attention_mask=attention_mask)
+        outputs = self.wav2vec2(
+            input_values=input_values,
+            attention_mask=attention_mask,
+        )
         hidden_states = outputs.last_hidden_state
         logits = self.classifier(hidden_states)
 
