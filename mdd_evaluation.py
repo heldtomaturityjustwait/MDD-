@@ -170,14 +170,18 @@ def parse_annotation_for_mdd(textgrid_path: str) -> tuple[list[str], list[str]]:
                 if canon_ph != "sil":
                     canonical_phones.append(canon_ph)
 
-                pronounced_clean = pronounced_raw.replace("*", "").strip()
-                if pronounced_clean.lower() == "err":
-                    # Uninterpretable — treat as deletion on the human side
-                    pass
-                else:
-                    human_ph = normalize_phoneme(pronounced_clean)
-                    if human_ph != "sil":
-                        human_phones.append(human_ph)
+                    pronounced_clean = pronounced_raw.replace("*", "").strip()
+                    if pronounced_clean.lower() == "err":
+                        # Uninterpretable — treat as deletion on the human side.
+                        # Must still append a placeholder so human stays aligned
+                        # with canonical (one slot per canonical phoneme).
+                        human_phones.append(None)
+                    else:
+                        human_ph = normalize_phoneme(pronounced_clean)
+                        if human_ph != "sil":
+                            human_phones.append(human_ph)
+                        else:
+                            human_phones.append(None)  # sil treated as deletion
 
             elif error_type == "d":
                 # Deletion — canonical slot exists; speaker produced nothing
@@ -467,8 +471,10 @@ def count_phonological_mdd(
       1. canonical and human phonemes are converted to 35 binary feature refs;
       2. SCTC-SB logits are decoded into 35 +att/-att sequences with blank
          removal and CTC repeat collapse;
-      3. each decoded feature sequence is Levenshtein-aligned to the canonical
-         feature sequence before TA/FA/FR/CD/DE counting.
+      3. each decoded feature sequence is positionally aligned (zip) to the
+         canonical feature sequence — NOT Levenshtein, because matching a 1
+         from one phoneme slot to a 1 from a different slot is phonetically
+         meaningless and would artificially inflate FA counts.
     """
     phon_counts = PhonologicalMDDCounts()
     n = len(canonical)
@@ -725,22 +731,35 @@ def _run_phonological_wav2vec2(
 ) -> np.ndarray:
     """
     Run PhonologicalWav2Vec2 (SCTC-SB) → raw logits (T, 71) as a numpy array.
+
+    Logits are trimmed to the valid (non-padded) frame count using the
+    output_lengths returned by the model's forward pass.
     """
     import torch
     inputs = feature_extractor(
         waveform.numpy(), sampling_rate=16000, return_tensors="pt", padding=True
     )
     with torch.no_grad():
-        outputs = model(inputs.input_values.to(device))
+        outputs = model(inputs.input_values.to(device),
+                        inputs.get("attention_mask", None))
 
     if isinstance(outputs, (tuple, list)):
-        logits = outputs[0]
+        logits, output_lengths = outputs[0], outputs[1]
     elif hasattr(outputs, "logits"):
         logits = outputs.logits
+        output_lengths = None
     else:
         logits = outputs
+        output_lengths = None
 
-    return logits.squeeze(0).cpu().numpy()   # (T, 71)
+    logits_np = logits.squeeze(0).cpu().numpy()   # (T, 71)
+
+    # Trim to valid frames — removes any padding frames at the tail
+    if output_lengths is not None:
+        valid_len = int(output_lengths[0].item())
+        logits_np = logits_np[:valid_len]
+
+    return logits_np
 
 
 # ─────────────────────────────────────────────────────────────────────────────
