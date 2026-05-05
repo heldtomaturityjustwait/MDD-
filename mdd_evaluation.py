@@ -438,27 +438,21 @@ def _decode_sctcSB_logits_to_feature_sequences(logits: np.ndarray) -> list[list[
 
 def _align_binary_sequence_to_canonical(ref_seq: list[int], hyp_seq: list[int]) -> list[Optional[int]]:
     """
-    Align one decoded feature sequence to its canonical reference sequence.
+    Align one decoded feature sequence to its canonical reference sequence
+    using simple positional (zip) alignment.
 
-    Returns a list with length len(ref_seq). Insertions in hyp_seq are ignored
-    because they do not correspond to a canonical phoneme position. Deletions are
-    represented as None.
+    The CTC-decoded feature sequence has one value per predicted phoneme slot.
+    We align it position-by-position to the canonical sequence — the same way
+    phoneme sequences are aligned in count_phoneme_mdd. Levenshtein alignment
+    is wrong here because 0/1 are not identity tokens; matching a 1 from one
+    position to a 1 from a completely different position is phonetically
+    meaningless and inflates FA artificially.
+
+    Returns a list of length len(ref_seq). Positions where hyp_seq is shorter
+    are filled with None (deletion). Extra hyp tokens beyond len(ref_seq) are
+    ignored.
     """
-    from alignment import levenshtein_alignment
-
-    _, _, _, ops = levenshtein_alignment(ref_seq, hyp_seq)
-    aligned: list[Optional[int]] = []
-    for op, ref_val, hyp_val in ops:
-        if op == "I":
-            continue
-        if op == "D":
-            aligned.append(None)
-        else:  # C or S
-            aligned.append(int(hyp_val))
-
-    if len(aligned) < len(ref_seq):
-        aligned.extend([None] * (len(ref_seq) - len(aligned)))
-    return aligned[:len(ref_seq)]
+    return [hyp_seq[i] if i < len(hyp_seq) else None for i in range(len(ref_seq))]
 
 
 def count_phonological_mdd(
