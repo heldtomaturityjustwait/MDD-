@@ -964,7 +964,7 @@ if __name__ == "__main__":
     from transformers import Wav2Vec2FeatureExtractor
 
     # L2-ARCTIC scripted test speakers (Ye et al. 2022 / Shahin et al. 2025)
-    DEFAULT_TEST_SPEAKERS = ["ASI", "YBAA", "HJK", "BWC", "EBVS", "YDCK"]
+    DEFAULT_TEST_SPEAKERS = ["RRBI", "YBAA", "HJK", "BWC", "EBVS", "YDCK"]
     speakers = args.speakers if args.speakers else DEFAULT_TEST_SPEAKERS
     print(f"Evaluating speakers: {speakers}")
     print(f"Device: {args.device}\n")
