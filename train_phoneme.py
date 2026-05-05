@@ -83,12 +83,14 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def ctc_decode(logits: torch.Tensor) -> list:
+def ctc_decode(logits: torch.Tensor, output_lengths: torch.Tensor = None) -> list:
     preds = logits.argmax(dim=-1)
     results = []
     for b in range(preds.shape[0]):
+        # Trim to valid (non-padded) frames for this item
+        valid_len = output_lengths[b].item() if output_lengths is not None else preds.shape[1]
         seq, prev = [], -1
-        for p in preds[b].tolist():
+        for p in preds[b, :valid_len].tolist():
             if p == BLANK_IDX:
                 prev = -1
                 continue
@@ -126,17 +128,16 @@ class PhonemeStats:
 
     def update_from_alignment(self, ref: list, hyp: list) -> None:
         _, _, _, aligned_pairs = levenshtein_alignment(ref, hyp)
-        for r, h in aligned_pairs:
-            if r is not None and h is not None:
-                if r == h:
-                    self.tp[r] += 1
-                else:
-                    self.fn[r] += 1   # substitution — ref missed
-                    self.fp[h] += 1   # substitution — wrong hyp output
-            elif r is not None:
-                self.fn[r] += 1       # deletion
-            elif h is not None:
-                self.fp[h] += 1       # insertion
+        for op, r, h in aligned_pairs:
+            if op == "C":               # correct match
+                self.tp[r] += 1
+            elif op == "S":             # substitution
+                self.fn[r] += 1         # ref phoneme missed
+                self.fp[h] += 1         # wrong hyp phoneme output
+            elif op == "D":             # deletion (ref has phoneme, hyp skipped it)
+                self.fn[r] += 1
+            elif op == "I":             # insertion (hyp added phoneme not in ref)
+                self.fp[h] += 1
 
     def print_report(self, label: str) -> None:
         cmu_set = set(CMU_39_PHONEMES)
@@ -241,8 +242,8 @@ def evaluate(model, loader, device, label="Test",
     for batch_idx, batch in enumerate(loader):
         input_values   = batch["input_values"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        logits, _      = model(input_values, attention_mask)
-        recognized     = ctc_decode(logits)
+        logits, output_lengths = model(input_values, attention_mask)
+        recognized     = ctc_decode(logits, output_lengths)
 
         for b in range(len(batch["actual_phones"])):
             actual = [p for p in batch["actual_phones"][b] if p != "sil"]

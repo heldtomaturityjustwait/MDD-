@@ -82,9 +82,14 @@ class PhonologicalWav2Vec2(nn.Module):
         self,
         input_values: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        apply_spec_augment: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass.
+
+        Paper Section 5.2: "SpecAugment was applied to the output of the
+        CNN encoder to add more variations to the training data."
+        Pass apply_spec_augment=True during training, False during eval.
 
         Returns:
             logits        : (B, T_frames, 71)  raw logits
@@ -95,7 +100,24 @@ class PhonologicalWav2Vec2(nn.Module):
             attention_mask=attention_mask,
             output_hidden_states=False,
         )
-        hidden_states = outputs.last_hidden_state
+        hidden_states = outputs.last_hidden_state  # (B, T, 1024)
+
+        # ── SpecAugment (paper Section 5.2, Park et al. 2019) ────────────
+        # Applied to CNN encoder output (= transformer input) during training.
+        # Time mask: up to 10% of frames. Frequency mask: up to F=27 dims.
+        if apply_spec_augment and self.training:
+            B, T, D = hidden_states.shape
+            hidden_states = hidden_states.clone()
+            # Time masking — one mask per utterance
+            t_len = max(1, int(T * 0.10))
+            for b in range(B):
+                t0 = torch.randint(0, max(1, T - t_len), (1,)).item()
+                hidden_states[b, t0:t0 + t_len, :] = 0.0
+            # Frequency masking — one shared mask across the batch
+            f_len = min(27, D)
+            f0 = torch.randint(0, D - f_len, (1,)).item()
+            hidden_states[:, :, f0:f0 + f_len] = 0.0
+
         logits = self.classifier(hidden_states)
 
         if attention_mask is not None:

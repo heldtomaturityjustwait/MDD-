@@ -68,6 +68,7 @@ def load_config(config_path: str) -> dict:
 def train_epoch(
     model, loss_fn, loader, optimizer, scheduler,
     device, grad_accum_steps, epoch, log_every=50,
+    use_spec_augment: bool = True,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -80,7 +81,8 @@ def train_epoch(
         attention_mask = batch["attention_mask"].to(device)
         ctc_labels     = batch["ctc_labels"]
 
-        logits, output_lengths = model(input_values, attention_mask)
+        logits, output_lengths = model(input_values, attention_mask,
+                                       apply_spec_augment=use_spec_augment)
         logits_t       = logits.transpose(0, 1)           # (T, B, 71)
         output_lengths = output_lengths.clamp(max=logits_t.shape[0])
 
@@ -279,6 +281,7 @@ def main():
         train_loss = train_epoch(
             model, loss_fn, train_loader, optimizer, scheduler,
             device, grad_accum, epoch, cfg["training"]["log_every"],
+            use_spec_augment=cfg["training"].get("use_spec_augment", True),
         )
         logger.info(
             f"  Epoch {epoch} loss={train_loss:.4f} | "
