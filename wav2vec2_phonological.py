@@ -74,14 +74,6 @@ class PhonologicalWav2Vec2(nn.Module):
         hidden_size = self.wav2vec2.config.hidden_size
         self.classifier = nn.Linear(hidden_size, num_output_nodes)
 
-        # ── Blank node bias initialization ────────────────────────────────
-        # The shared blank node (index 70) appears in all 35 category losses,
-        # so it receives 35x more gradient than any feature node. Without
-        # correction, CTC collapses to predicting blank at every timestep
-        # within the first epoch. Initializing the blank bias to -4.0 forces
-        # the model to earn blank probability rather than defaulting to it.
-        with torch.no_grad():
-            self.classifier.bias[self.blank_idx].fill_(-2.5)
 
         print(f"[PhonologicalWav2Vec2] hidden_size={hidden_size}, "
               f"output_nodes={num_output_nodes}")
@@ -214,13 +206,6 @@ class PhonemeLevelWav2Vec2(nn.Module):
         hidden_size = self.wav2vec2.config.hidden_size
         # 40 nodes: 39 phonemes + 1 blank
         self.classifier = nn.Linear(hidden_size, num_phonemes + 1)
-
-        # ── Blank node bias initialization ────────────────────────────────
-        # Same CTC blank collapse problem as the phonological model.
-        # Initialize blank bias (index 39) to -0.75 to prevent the model
-        # from defaulting to all-blank predictions early in training.
-        with torch.no_grad():
-            self.classifier.bias[self.blank_idx].fill_(-0.75)
 
     def forward(self, input_values, attention_mask=None):
         outputs = self.wav2vec2(
