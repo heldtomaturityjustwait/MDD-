@@ -89,35 +89,49 @@ class PhonologicalWav2Vec2(nn.Module):
 
         Paper Section 5.2: "SpecAugment was applied to the output of the
         CNN encoder to add more variations to the training data."
-        Pass apply_spec_augment=True during training, False during eval.
+
+        Wav2Vec2Model natively applies SpecAugment between the CNN encoder
+        and the transformer when mask_time_indices is provided. This is the
+        correct placement — our previous implementation applied masking to
+        last_hidden_state (after the full transformer), which was wrong.
 
         Returns:
             logits        : (B, T_frames, 71)  raw logits
             output_lengths: (B,)  number of valid frames per batch item
         """
+        # Build mask_time_indices for SpecAugment if training
+        mask_time_indices = None
+        if apply_spec_augment and self.training:
+            # Compute output frame lengths to know valid T per item
+            if attention_mask is not None:
+                feat_lengths = self._get_feat_extract_output_lengths(
+                    attention_mask.sum(dim=1)
+                )
+            else:
+                B, T_audio = input_values.shape
+                ones = torch.ones(B, dtype=torch.long, device=input_values.device) * T_audio
+                feat_lengths = self._get_feat_extract_output_lengths(ones)
+
+            B = input_values.shape[0]
+            T = int(feat_lengths.max().item())
+
+            # Build boolean mask: mask up to 10% of valid frames per utterance
+            mask_time_indices = torch.zeros(B, T, dtype=torch.bool,
+                                            device=input_values.device)
+            t_len = max(1, int(T * 0.10))
+            for b in range(B):
+                valid = int(feat_lengths[b].item())
+                if valid > t_len:
+                    t0 = torch.randint(0, valid - t_len, (1,)).item()
+                    mask_time_indices[b, t0:t0 + t_len] = True
+
         outputs = self.wav2vec2(
             input_values=input_values,
             attention_mask=attention_mask,
+            mask_time_indices=mask_time_indices,
             output_hidden_states=False,
         )
         hidden_states = outputs.last_hidden_state  # (B, T, 1024)
-
-        # ── SpecAugment (paper Section 5.2, Park et al. 2019) ────────────
-        # Applied to CNN encoder output (= transformer input) during training.
-        # Time mask: up to 10% of frames. Frequency mask: up to F=27 dims.
-        if apply_spec_augment and self.training:
-            B, T, D = hidden_states.shape
-            hidden_states = hidden_states.clone()
-            # Time masking — one mask per utterance
-            t_len = max(1, int(T * 0.10))
-            for b in range(B):
-                t0 = torch.randint(0, max(1, T - t_len), (1,)).item()
-                hidden_states[b, t0:t0 + t_len, :] = 0.0
-            # Frequency masking — one shared mask across the batch
-            f_len = min(27, D)
-            f0 = torch.randint(0, D - f_len, (1,)).item()
-            hidden_states[:, :, f0:f0 + f_len] = 0.0
-
         logits = self.classifier(hidden_states)
 
         if attention_mask is not None:
