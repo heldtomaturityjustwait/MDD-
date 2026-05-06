@@ -503,15 +503,33 @@ def count_phonological_mdd(
     """
     Phonological feature-level MDD counting for one utterance.
 
-    Corrected to match Shahin et al.'s CTC-style phonological evaluation:
-      1. canonical and human phonemes are converted to 35 binary feature refs;
-      2. SCTC-SB logits are decoded into 35 +att/-att sequences with blank
-         removal and CTC repeat collapse;
-      3. each decoded feature sequence is positionally aligned (zip) to the
-         canonical feature sequence — NOT Levenshtein, because matching a 1
-         from one phoneme slot to a 1 from a different slot is phonetically
-         meaningless and would artificially inflate FA counts.
+    Follows Shahin et al. Section 6.2.2 exactly:
+      "The evaluation was performed for each feature separately by aligning
+       each output sequence with the corresponding reference sequence obtained
+       by mapping the target phoneme sequence to the target phonological
+       feature sequence."
+
+    For each feature i:
+      1. Build reference binary sequence from canonical phonemes → [0,1,0,1,...]
+      2. Build human binary sequence from human phonemes (annotation-aligned)
+      3. CTC-decode model logits → predicted binary sequence
+      4. Levenshtein-align predicted sequence to reference sequence
+         (same alignment used for FER in Section 5.3.1 / Eq. 8)
+      5. At each canonical position after alignment:
+         - speaker_correct = (human_feat == canon_feat)
+           e.g. /s/→/z/ substitution: voiced feature is wrong, all others correct
+         - model_accepted  = (pred_feat == canon_feat)
+         → classify as TA/FA/FR/TR_CD/TR_DE
+
+    Note on Levenshtein on binary sequences: the paper acknowledges that
+    "obtaining frame-level alignment from the CTC model is not accurate"
+    (Section 6.1.3) and uses sequence-level Levenshtein alignment instead.
+    Matching a 0 or 1 from one position to the same value at another position
+    is imperfect but is what the paper does — it handles CTC length variance
+    far better than zip alignment which floods results with None.
     """
+    from alignment import levenshtein_alignment
+
     phon_counts = PhonologicalMDDCounts()
     n = len(canonical)
     if n == 0:
@@ -519,8 +537,9 @@ def count_phonological_mdd(
 
     canon_feats = np.stack([_phoneme_to_binary_array(ph) for ph in canonical])
 
+    # human is annotation-aligned: same length as canonical, None for deletions
     paired_human = _zip_to_canonical(canonical, human)
-    human_feats = np.zeros((n, NUM_FEATURES), dtype=np.int8)
+    human_feats  = np.zeros((n, NUM_FEATURES), dtype=np.int8)
     human_missing = np.zeros(n, dtype=bool)
     for i, human_ph in enumerate(paired_human):
         if human_ph is None:
@@ -532,18 +551,29 @@ def count_phonological_mdd(
 
     for f_idx, feat_name in enumerate(PHONOLOGICAL_FEATURES):
         cnt = phon_counts.counts[feat_name]
-        ref_seq = canon_feats[:, f_idx].astype(int).tolist()
-        pred_aligned = _align_binary_sequence_to_canonical(
-            ref_seq,
-            [int(x) for x in pred_feature_seqs[f_idx]],
-        )
 
-        for i in range(n):
-            canon_f = int(canon_feats[i, f_idx])
-            human_f = None if human_missing[i] else int(human_feats[i, f_idx])
-            pred_f = pred_aligned[i]
+        ref_seq  = canon_feats[:, f_idx].astype(int).tolist()   # length n
+        hyp_seq  = [int(x) for x in pred_feature_seqs[f_idx]]  # CTC-collapsed
 
-            model_accepted = (pred_f == canon_f)
+        # Levenshtein-align hypothesis to reference (paper Section 6.2.2)
+        # ops: list of (op, ref_val, hyp_val) covering all n canonical positions
+        _, _, _, ops = levenshtein_alignment(ref_seq, hyp_seq)
+
+        ref_pos = 0
+        for op, ref_val, hyp_val in ops:
+            if ref_pos >= n:
+                break
+
+            if op == "I":
+                # Model inserted extra token — no canonical slot consumed
+                continue
+
+            # C, S, D all consume one canonical position
+            pred_f  = None if op == "D" else int(hyp_val)
+            canon_f = int(canon_feats[ref_pos, f_idx])
+            human_f = None if human_missing[ref_pos] else int(human_feats[ref_pos, f_idx])
+
+            model_accepted  = (pred_f == canon_f)
             speaker_correct = (human_f == canon_f)
 
             if speaker_correct and model_accepted:
@@ -553,10 +583,13 @@ def count_phonological_mdd(
             elif speaker_correct and (not model_accepted):
                 cnt.FR += 1
             else:
+                # TR: model detected error — CD if it matches what was actually said
                 if pred_f is not None and human_f is not None and pred_f == human_f:
                     cnt.TR_CD += 1
                 else:
                     cnt.TR_DE += 1
+
+            ref_pos += 1
 
     return phon_counts
 
