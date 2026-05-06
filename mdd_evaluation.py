@@ -538,20 +538,20 @@ def count_phonological_mdd(
     # All 35 sequences share the same length U (shared blank ensures this).
     # We read them vertically: pred_matrix[i, f] = feature f at phoneme slot i.
     pred_feature_seqs = _decode_sctcSB_logits_to_feature_sequences(predicted_logits)
-    U = len(pred_feature_seqs[0])  # shared length; all 35 are equal
 
-    # ── Zip-align once: U predicted slots → N canonical slots ────────────────
-    # pred_matrix[i] is the full 35-dim vector for canonical position i,
-    # or None if the model produced fewer than i+1 phoneme slots.
-    pred_matrix: list[Optional[list[int]]] = [
-        [int(pred_feature_seqs[f][i]) for f in range(NUM_FEATURES)]
-        if i < U else None
+    # ── Transpose: list[35][U] → list[U][35] then zip-align to N ─────────────
+    # All 35 sequences are equal length U (shared blank guarantees this).
+    # Reading vertically gives one 35-dim feature vector per predicted phoneme slot.
+    U = len(pred_feature_seqs[0])
+    pred_matrix = list(zip(*pred_feature_seqs))          # (U, 35)
+    pred_matrix_aligned = [
+        list(pred_matrix[i]) if i < U else None
         for i in range(n)
     ]
 
     # ── Evaluate: position-first, then feature ────────────────────────────────
     for i in range(n):
-        pred_vec  = pred_matrix[i]   # list[35] or None
+        pred_vec  = pred_matrix_aligned[i]   # list[35] or None
         human_vec = None if human_missing[i] else human_feats[i]
 
         for f_idx, feat_name in enumerate(PHONOLOGICAL_FEATURES):
@@ -559,7 +559,7 @@ def count_phonological_mdd(
 
             canon_f = int(canon_feats[i, f_idx])
             human_f = None if human_vec is None else int(human_vec[f_idx])
-            pred_f  = None if pred_vec  is None else pred_vec[f_idx]
+            pred_f  = None if pred_vec is None else pred_vec[f_idx]
 
             model_accepted  = (pred_f  == canon_f)
             speaker_correct = (human_f == canon_f)
