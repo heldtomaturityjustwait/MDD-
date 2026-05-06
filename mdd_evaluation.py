@@ -884,7 +884,8 @@ def evaluate_mdd(
                 logger.warning(f"[{utt_id}] no canonical phones from annotation, skipping")
                 n_skipped += 1
                 continue
-            if not human:
+            # human can contain None entries (deletions) — only skip if list itself is empty
+            if len(human) == 0:
                 logger.warning(f"[{utt_id}] no human phones from annotation, skipping")
                 n_skipped += 1
                 continue
@@ -978,7 +979,33 @@ if __name__ == "__main__":
                     logits[t, neg] =  1.0
         return logits
 
-    pred_logits = _make_perfect_logits(["ae", "d", "f", "ey", "z"])
+    # ── Sanity check test data ────────────────────────────────────────────────
+    # Simulates one utterance with 5 canonical positions:
+    #   pos 0: ae  correct (human=ae)        → should be TA
+    #   pos 1: d   substitution (human=t)    → FA if model predicts d, TR if not
+    #   pos 2: v   correct (human=v)         → TA if model predicts v, FR if not
+    #   pos 3: ey  substitution (human=ay)   → FA if model predicts ey
+    #   pos 4: s   deletion (human=None)     → FR if model predicts s, TR if not
+    _canonical = ["ae", "d",  "v",  "ey", "s"]
+    _human     = ["ae", "t",  "v",  "ay", None]
+
+    print("  Testing count_phoneme_mdd with perfect predicted=canonical ...")
+    ph_result = count_phoneme_mdd(_canonical, _human, _canonical[:])
+    # predicted == canonical everywhere:
+    #   pos 0: TA (human correct, accepted)
+    #   pos 1: FA (human wrong,   accepted)
+    #   pos 2: TA
+    #   pos 3: FA
+    #   pos 4: FR (human None != canonical "s", but predicted == canonical "s"
+    #              → speaker_correct=False, model_accepted=True → FA)
+    assert ph_result.TA >= 2, f"Expected TA>=2, got {ph_result.TA}"
+    assert ph_result.FA >= 2, f"Expected FA>=2, got {ph_result.FA}"
+    assert ph_result.FR == 0, f"Expected FR=0, got {ph_result.FR}"
+    print(f"    TA={ph_result.TA} FA={ph_result.FA} FR={ph_result.FR} "
+          f"TR_CD={ph_result.TR_CD} TR_DE={ph_result.TR_DE}  PASSED")
+
+    print("  Testing count_phonological_mdd ...")
+    pred_logits = _make_perfect_logits(["ae", "d", "v", "ey", "s"])
     phon_result = count_phonological_mdd(_canonical, _human, pred_logits)
     macro = phon_result.summary()["__macro_avg__"]
     print(f"  Macro FAR={macro['FAR']}  FRR={macro['FRR']}  DER={macro['DER']}")
