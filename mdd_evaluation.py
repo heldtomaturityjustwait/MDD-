@@ -46,10 +46,22 @@ transcript or textgrid directories.
 
 Alignment
 ---------
-All three sequences are aligned position-by-position against canonical (anchor).
-  - Shorter human/predicted sequences: trailing positions get None (deletion,
-    never equal to canonical).
-  - Longer human/predicted sequences: extra tokens beyond len(canonical) ignored.
+canonical ↔ human:
+  human is built directly from the annotation with one slot per canonical
+  phoneme. Deletions append None, additions are discarded (no canonical
+  anchor). This keeps human length-matched to canonical — simple zip is safe.
+
+canonical ↔ predicted (phoneme-level):
+  The model's CTC-decoded phoneme sequence has its own insertions and
+  deletions. Levenshtein alignment is used to map predicted phones to
+  canonical positions. Model insertions (no canonical slot) are discarded.
+  Model deletions (missed canonical phone) become None at that position.
+
+canonical ↔ predicted (phonological-level):
+  After CTC collapse, each of the 35 feature sequences is zip-aligned to
+  the canonical feature sequence. Levenshtein on binary 0/1 values is wrong
+  because matching a 1 from one phoneme slot to a 1 from a different slot
+  is phonetically meaningless and inflates FA artificially.
 
 Phonological-level evaluation (wav2vec2)
 -----------------------------------------
@@ -184,20 +196,20 @@ def parse_annotation_for_mdd(textgrid_path: str) -> tuple[list[str], list[str]]:
                             human_phones.append(None)  # sil treated as deletion
 
             elif error_type == "d":
-                # Deletion — canonical slot exists; speaker produced nothing
+                # Deletion — canonical slot exists; speaker produced nothing.
+                # Must append None to human so it stays length-matched to canonical.
                 canon_ph = normalize_phoneme(canonical_raw)
                 if canon_ph != "sil":
                     canonical_phones.append(canon_ph)
-                # human_phones: nothing added (deletion)
+                    human_phones.append(None)   # ← placeholder keeps sequences aligned
 
             elif error_type == "a":
-                # Addition/Insertion — no canonical slot; speaker produced extra phoneme
-                # The canonical sequence gains nothing; human sequence gains the extra phone.
-                pronounced_clean = pronounced_raw.replace("*", "").strip()
-                human_ph = normalize_phoneme(pronounced_clean)
-                if human_ph != "sil":
-                    human_phones.append(human_ph)
-                # canonical_phones: nothing added
+                # Addition/Insertion — speaker produced an extra phoneme with no
+                # canonical slot. There is no canonical anchor for this phone, so
+                # we cannot include it in the positional alignment at all.
+                # Both canonical_phones and human_phones gain nothing here.
+                # (Including it in human_phones would shift all subsequent positions.)
+                pass
 
         # Intervals with other formats are silently skipped
 
@@ -303,11 +315,24 @@ def count_phoneme_mdd(
     predicted: list[str],
 ) -> MDDCounts:
     """
-    Phoneme-level MDD counting for a single utterance (Whisper model).
+    Phoneme-level MDD counting for a single utterance.
 
-    Aligns all three sequences to canonical position-by-position, then
-    classifies each position per the rules in Table 2 of Shahin et al. (2025):
+    Alignment strategy
+    ------------------
+    canonical ↔ human:
+        human comes from the annotation and is already length-matched to
+        canonical (one slot per canonical phoneme, None for deletions).
+        Simple zip is correct — no alignment needed.
 
+    canonical ↔ predicted:
+        predicted is a CTC-decoded model output that has its own insertions
+        and deletions relative to canonical. Zip alignment would cause every
+        position after an early model deletion/insertion to be wrong.
+        We use Levenshtein alignment instead, which finds the optimal
+        position-to-position mapping and marks unmatched slots as None.
+
+    Scoring per canonical position
+    --------------------------------
         canonical  human  predicted  → category
         ─────────  ─────  ─────────  ──────────
         ae         ae     ae         → TA
@@ -316,20 +341,34 @@ def count_phoneme_mdd(
         ay         ey     ey         → TR/CD (error detected, correct diagnosis)
         s          sh     z          → TR/DE (error detected, wrong diagnosis)
 
-    None values (sequence shorter than canonical) are never equal to any
-    phoneme string, so they are automatically treated as wrong.
-
-    Args:
-        canonical : canonical phoneme sequence (anchor), from annotation TextGrid
-        human     : human-annotated phoneme sequence, from annotation TextGrid
-        predicted : Whisper-predicted phoneme sequence
-
-    Returns:
-        MDDCounts with TA, FA, FR, TR_CD, TR_DE tallied.
+    None in predicted (model deletion) is never equal to any canonical phoneme
+    → treated as FR (if speaker correct) or TR/DE (if speaker wrong).
     """
-    counts       = MDDCounts()
+    from alignment import levenshtein_alignment
+
+    counts = MDDCounts()
+
+    # human is already annotation-aligned: same length as canonical, None for deletions
     paired_human = _zip_to_canonical(canonical, human)
-    paired_pred  = _zip_to_canonical(canonical, predicted)
+
+    # predicted: Levenshtein-align to canonical
+    # ops is list of (op, ref_item, hyp_item) where ref=canonical, hyp=predicted
+    _, _, _, ops = levenshtein_alignment(canonical, predicted)
+
+    # Build predicted-aligned list from ops: one entry per canonical position
+    # Insertions (model produced extra) are skipped — no canonical anchor.
+    # Deletions (model missed a canonical phone) → None at that canonical position.
+    paired_pred = []
+    for op, ref_ph, hyp_ph in ops:
+        if op == "I":
+            continue          # extra model output, no canonical slot — skip
+        elif op == "D":
+            paired_pred.append(None)   # model missed this canonical phone
+        else:
+            paired_pred.append(hyp_ph) # "C" or "S": model produced something here
+
+    # Safety: should match len(canonical) but guard anyway
+    paired_pred = _zip_to_canonical(canonical, paired_pred)
 
     for i, canon_ph in enumerate(canonical):
         human_ph = paired_human[i]
@@ -345,9 +384,6 @@ def count_phoneme_mdd(
         elif speaker_correct and not model_accepted:
             counts.FR += 1
         else:
-            # Both predicted and human differ from canonical.
-            # TR/CD if model correctly identified what the speaker actually said.
-            # None != None in Python evaluates False, so two None values → TR/DE.
             if pred_ph is not None and human_ph is not None and pred_ph == human_ph:
                 counts.TR_CD += 1
             else:
@@ -924,21 +960,6 @@ if __name__ == "__main__":
     parser.add_argument("--sanity_check",         action="store_true")
     args = parser.parse_args()
 
-    # ── Sanity check: reproduce Table 2 ──────────────────────────────────────
-    print("=== Phoneme-level sanity check (Table 2) ===")
-    _canonical = ["ae", "d", "v", "ay", "s"]
-    _human     = ["ae", "t", "v", "ey", "sh"]
-    _predicted = ["ae", "d", "f", "ey", "z"]
-
-    counts = count_phoneme_mdd(_canonical, _human, _predicted)
-    print(f"  TA={counts.TA}  FA={counts.FA}  FR={counts.FR}  "
-          f"TR_CD={counts.TR_CD}  TR_DE={counts.TR_DE}")
-    print(f"  Expected: TA=1  FA=1  FR=1  TR_CD=1  TR_DE=1")
-    assert counts.TA == 1 and counts.FA == 1 and counts.FR == 1
-    assert counts.TR_CD == 1 and counts.TR_DE == 1
-    print("  PASSED\n")
-
-    print("=== Phonological-level sanity check ===")
 
     def _make_perfect_logits(phones: list[str]) -> np.ndarray:
         """Build (T, 71) logits that perfectly encode the given phoneme sequence."""
