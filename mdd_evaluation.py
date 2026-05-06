@@ -38,11 +38,6 @@ The three sequences used for evaluation
                       → list[str] of CMU-39 phonemes
       Phonological  : PhonologicalWav2Vec2 logits (T, 71) numpy array
 
-Source of truth
----------------
-Both canonical and human sequences come from annotation/<utt_id>.TextGrid only.
-Utterances with no annotation file are SKIPPED entirely — there is no fallback to
-transcript or textgrid directories.
 
 Alignment
 ---------
@@ -476,70 +471,62 @@ def _decode_sctcSB_logits_to_feature_sequences(logits: np.ndarray) -> list[list[
     )
 
 
-def _align_binary_sequence_to_canonical(ref_seq: list[int], hyp_seq: list[int]) -> list[Optional[int]]:
-    """
-    Align one decoded feature sequence to its canonical reference sequence
-    using simple positional (zip) alignment.
-
-    The CTC-decoded feature sequence has one value per predicted phoneme slot.
-    We align it position-by-position to the canonical sequence — the same way
-    phoneme sequences are aligned in count_phoneme_mdd. Levenshtein alignment
-    is wrong here because 0/1 are not identity tokens; matching a 1 from one
-    position to a 1 from a completely different position is phonetically
-    meaningless and inflates FA artificially.
-
-    Returns a list of length len(ref_seq). Positions where hyp_seq is shorter
-    are filled with None (deletion). Extra hyp tokens beyond len(ref_seq) are
-    ignored.
-    """
-    return [hyp_seq[i] if i < len(hyp_seq) else None for i in range(len(ref_seq))]
-
-
 def count_phonological_mdd(
     canonical:        list[str],
     human:            list[str],
     predicted_logits: np.ndarray,
 ) -> PhonologicalMDDCounts:
     """
-    Phonological feature-level MDD counting for one utterance.
+    Phonological feature-level MDD counting for a single utterance.
 
-    Follows Shahin et al. Section 6.2.2 exactly:
-      "The evaluation was performed for each feature separately by aligning
-       each output sequence with the corresponding reference sequence obtained
-       by mapping the target phoneme sequence to the target phonological
-       feature sequence."
+    Conceptual framing (phoneme-anchored vertical evaluation)
+    ---------------------------------------------------------
+    Think of the decoded output as a matrix of shape (U, 35) where U is the
+    number of predicted phoneme positions and 35 is the number of phonological
+    features. Each ROW is one predicted phoneme position; each COLUMN is one
+    feature across all positions.
 
-    For each feature i:
-      1. Build reference binary sequence from canonical phonemes → [0,1,0,1,...]
-      2. Build human binary sequence from human phonemes (annotation-aligned)
-      3. CTC-decode model logits → predicted binary sequence
-      4. Levenshtein-align predicted sequence to reference sequence
-         (same alignment used for FER in Section 5.3.1 / Eq. 8)
-      5. At each canonical position after alignment:
-         - speaker_correct = (human_feat == canon_feat)
-           e.g. /s/→/z/ substitution: voiced feature is wrong, all others correct
-         - model_accepted  = (pred_feat == canon_feat)
-         → classify as TA/FA/FR/TR_CD/TR_DE
+    This is valid because the SCTC-SB model uses a SHARED blank node (index 70)
+    across all 35 features. When blank dominates at frame t, every feature sees
+    blank simultaneously. After CTC collapse (remove blanks, merge consecutive
+    repeats), all 35 feature sequences therefore come out the same length U.
 
-    Note on Levenshtein on binary sequences: the paper acknowledges that
-    "obtaining frame-level alignment from the CTC model is not accurate"
-    (Section 6.1.3) and uses sequence-level Levenshtein alignment instead.
-    Matching a 0 or 1 from one position to the same value at another position
-    is imperfect but is what the paper does — it handles CTC length variance
-    far better than zip alignment which floods results with None.
+    Alignment
+    ---------
+    The U predicted phoneme positions are zip-aligned ONCE to the N canonical
+    positions. Positions where U < N are filled with None (model deletion).
+    This single alignment anchors all 35 features to the same canonical slot,
+    preserving phoneme identity across features.
+
+    Evaluation
+    ----------
+    At each canonical position i we have:
+      canon_vec[i]  — 35-dim binary vector from PHONEME_FEATURES[canonical[i]]
+      human_vec[i]  — 35-dim binary vector from PHONEME_FEATURES[human[i]]
+                      (None row if speaker deleted this position)
+      pred_vec[i]   — 35-dim binary vector read vertically from the decoded
+                      matrix at row i  (None if model deleted this position)
+
+    For each feature f at position i, classify as TA / FA / FR / TR_CD / TR_DE
+    by comparing canon_vec[i,f], human_vec[i,f], pred_vec[i,f].
+
+    Example: canonical /s/ mispronounced as /z/ by speaker, model predicts /z/.
+      canon_vec = [..., voiced=0, ...]
+      human_vec = [..., voiced=1, ...]
+      pred_vec  = [..., voiced=1, ...]
+      → voiced feature: TR_CD  (detected, correctly diagnosed)
+      → all other features: TA  (model agrees with both canonical and human)
     """
-    from alignment import levenshtein_alignment
-
     phon_counts = PhonologicalMDDCounts()
     n = len(canonical)
     if n == 0:
         return phon_counts
 
-    canon_feats = np.stack([_phoneme_to_binary_array(ph) for ph in canonical])
+    # ── Build canonical and human feature matrices (N, 35) ───────────────────
+    canon_feats = np.stack([_phoneme_to_binary_array(ph) for ph in canonical])  # (N, 35)
 
-    # human is annotation-aligned: same length as canonical, None for deletions
     paired_human = _zip_to_canonical(canonical, human)
-    human_feats  = np.zeros((n, NUM_FEATURES), dtype=np.int8)
+    human_feats   = np.zeros((n, NUM_FEATURES), dtype=np.int8)
     human_missing = np.zeros(n, dtype=bool)
     for i, human_ph in enumerate(paired_human):
         if human_ph is None:
@@ -547,33 +534,34 @@ def count_phonological_mdd(
         else:
             human_feats[i] = _phoneme_to_binary_array(human_ph)
 
+    # ── Decode logits → (U, 35) predicted feature matrix ─────────────────────
+    # All 35 sequences share the same length U (shared blank ensures this).
+    # We read them vertically: pred_matrix[i, f] = feature f at phoneme slot i.
     pred_feature_seqs = _decode_sctcSB_logits_to_feature_sequences(predicted_logits)
+    U = len(pred_feature_seqs[0])  # shared length; all 35 are equal
 
-    for f_idx, feat_name in enumerate(PHONOLOGICAL_FEATURES):
-        cnt = phon_counts.counts[feat_name]
+    # ── Zip-align once: U predicted slots → N canonical slots ────────────────
+    # pred_matrix[i] is the full 35-dim vector for canonical position i,
+    # or None if the model produced fewer than i+1 phoneme slots.
+    pred_matrix: list[Optional[list[int]]] = [
+        [int(pred_feature_seqs[f][i]) for f in range(NUM_FEATURES)]
+        if i < U else None
+        for i in range(n)
+    ]
 
-        ref_seq  = canon_feats[:, f_idx].astype(int).tolist()   # length n
-        hyp_seq  = [int(x) for x in pred_feature_seqs[f_idx]]  # CTC-collapsed
+    # ── Evaluate: position-first, then feature ────────────────────────────────
+    for i in range(n):
+        pred_vec  = pred_matrix[i]   # list[35] or None
+        human_vec = None if human_missing[i] else human_feats[i]
 
-        # Levenshtein-align hypothesis to reference (paper Section 6.2.2)
-        # ops: list of (op, ref_val, hyp_val) covering all n canonical positions
-        _, _, _, ops = levenshtein_alignment(ref_seq, hyp_seq)
+        for f_idx, feat_name in enumerate(PHONOLOGICAL_FEATURES):
+            cnt = phon_counts.counts[feat_name]
 
-        ref_pos = 0
-        for op, ref_val, hyp_val in ops:
-            if ref_pos >= n:
-                break
+            canon_f = int(canon_feats[i, f_idx])
+            human_f = None if human_vec is None else int(human_vec[f_idx])
+            pred_f  = None if pred_vec  is None else pred_vec[f_idx]
 
-            if op == "I":
-                # Model inserted extra token — no canonical slot consumed
-                continue
-
-            # C, S, D all consume one canonical position
-            pred_f  = None if op == "D" else int(hyp_val)
-            canon_f = int(canon_feats[ref_pos, f_idx])
-            human_f = None if human_missing[ref_pos] else int(human_feats[ref_pos, f_idx])
-
-            model_accepted  = (pred_f == canon_f)
+            model_accepted  = (pred_f  == canon_f)
             speaker_correct = (human_f == canon_f)
 
             if speaker_correct and model_accepted:
@@ -583,13 +571,10 @@ def count_phonological_mdd(
             elif speaker_correct and (not model_accepted):
                 cnt.FR += 1
             else:
-                # TR: model detected error — CD if it matches what was actually said
                 if pred_f is not None and human_f is not None and pred_f == human_f:
                     cnt.TR_CD += 1
                 else:
                     cnt.TR_DE += 1
-
-            ref_pos += 1
 
     return phon_counts
 
