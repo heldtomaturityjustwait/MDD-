@@ -401,13 +401,21 @@ def _phoneme_to_binary_array(phoneme: str) -> np.ndarray:
 
 
 def _ctc_collapse_local_sequence(local_ids: list[int], blank_id: int = 2) -> list[int]:
+    """
+    Collapse one CTC path: remove blank labels and repeated non-blank labels.
+
+    For SCTC-SB each feature has a local alphabet:
+        0 = +att, 1 = -att, 2 = shared blank
+    """
     collapsed: list[int] = []
     prev = None
     for idx in local_ids:
-        if idx != prev and idx != blank_id:   # merge first, ignore blank second
+        if idx == blank_id:
+            prev = None
+            continue
+        if idx != prev:
             collapsed.append(idx)
-        if idx != blank_id:
-            prev = idx                         # only update prev on non-blank
+            prev = idx
     return collapsed
 
 
