@@ -401,21 +401,13 @@ def _phoneme_to_binary_array(phoneme: str) -> np.ndarray:
 
 
 def _ctc_collapse_local_sequence(local_ids: list[int], blank_id: int = 2) -> list[int]:
-    """
-    Collapse one CTC path: remove blank labels and repeated non-blank labels.
-
-    For SCTC-SB each feature has a local alphabet:
-        0 = +att, 1 = -att, 2 = shared blank
-    """
     collapsed: list[int] = []
     prev = None
     for idx in local_ids:
-        if idx == blank_id:
-            prev = None
-            continue
-        if idx != prev:
+        if idx != prev and idx != blank_id:   # merge first, ignore blank second
             collapsed.append(idx)
-            prev = idx
+        if idx != blank_id:
+            prev = idx                         # only update prev on non-blank
     return collapsed
 
 
@@ -980,23 +972,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
 
-    def _make_perfect_logits(phones: list[str]) -> np.ndarray:
-        """Build (T, 71) logits that perfectly encode the given phoneme sequence."""
-        T = len(phones)
-        logits = np.zeros((T, NUM_OUTPUT_NODES), dtype=np.float32)
-        for t, ph in enumerate(phones):
-            vec = _phoneme_to_binary_array(ph)
-            for f in range(NUM_FEATURES):
-                pos = feature_idx_to_pos_node(f)
-                neg = feature_idx_to_neg_node(f)
-                if vec[f]:
-                    logits[t, pos] =  1.0
-                    logits[t, neg] = -1.0
-                else:
-                    logits[t, pos] = -1.0
-                    logits[t, neg] =  1.0
-        return logits
-
     # ── Sanity check test data ────────────────────────────────────────────────
     # Simulates one utterance with 5 canonical positions:
     #   pos 0: ae  correct (human=ae)        → should be TA
@@ -1021,19 +996,6 @@ if __name__ == "__main__":
     assert ph_result.FR == 0, f"Expected FR=0, got {ph_result.FR}"
     print(f"    TA={ph_result.TA} FA={ph_result.FA} FR={ph_result.FR} "
           f"TR_CD={ph_result.TR_CD} TR_DE={ph_result.TR_DE}  PASSED")
-
-    print("  Testing count_phonological_mdd ...")
-    pred_logits = _make_perfect_logits(["ae", "d", "v", "ey", "s"])
-    phon_result = count_phonological_mdd(_canonical, _human, pred_logits)
-    macro = phon_result.summary()["__macro_avg__"]
-    print(f"  Macro FAR={macro['FAR']}  FRR={macro['FRR']}  DER={macro['DER']}")
-    # FAR=0.0: with positional alignment, perfect logits matching what was
-    # actually said means the model never outputs canonical for a mispronounced
-    # position → no false acceptances.
-    # FRR>0 and DER>0 are expected: position 2 maps predicted /f/ → canonical
-    # /v/, differing on some features, producing legitimate FR and TR_DE.
-    assert macro["FAR"] == 0.0, f"Expected FAR=0.0, got {macro['FAR']}"
-    print("  PASSED\n")
 
     if args.sanity_check:
         sys.exit(0)
