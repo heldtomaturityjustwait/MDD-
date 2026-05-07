@@ -577,9 +577,7 @@ def count_phonological_mdd(
 
     # Add this diagnostic at the top of count_phonological_mdd, after building canon_feats
     pred_feature_seqs = _decode_sctcSB_logits_to_feature_sequences(predicted_logits)
-    print(f"N canonical phonemes: {n}")
-    print(f"U_f collapsed lengths: {[len(s) for s in pred_feature_seqs[:5]]}")  # first 5 features
-    print(f"Canon feature sums (first 5): {[int(canon_feats[:, f].sum()) for f in range(5)]}")
+    
     paired_human  = _zip_to_canonical(canonical, human)
     human_feats   = np.zeros((n, NUM_FEATURES), dtype=np.int8)
     human_missing = np.zeros(n, dtype=bool)
@@ -609,37 +607,20 @@ def count_phonological_mdd(
             else:
                 pred_aligned[i, f_idx] = int(val)
 
-    _printed_first_utt = False
     # ── Evaluate: position-first, then feature ────────────────────────────────
     for i in range(n):
         human_vec = None if human_missing[i] else human_feats[i]
-        
+
         for f_idx, feat_name in enumerate(PHONOLOGICAL_FEATURES):
             cnt = phon_counts.counts[feat_name]
 
             canon_f = int(canon_feats[i, f_idx])
             human_f = None if human_vec is None else int(human_vec[f_idx])
             pred_f  = None if pred_missing[i, f_idx] else int(pred_aligned[i, f_idx])
-            # In count_phonological_mdd, inside the evaluation loop, add after building pred_matrix_aligned:
-            # Print first utterance details for feature 'voiced' (index 34)
-            f_idx = 34  # voiced
-            print("voiced feature comparison (first 10 positions):")
-            for i in range(min(10, n)):
-                pred_f = None if pred_missing[i, f_idx] else int(pred_aligned[i, f_idx])
-                human_f = None if human_missing[i] else int(human_feats[i, f_idx])
-                canon_f = int(canon_feats[i, f_idx])
-                print(f"  pos {i}: canon={canon_f} human={human_f} pred={pred_f} | ", end="")
-                if human_f != canon_f:
-                    print(f"MISPRONOUNCED", end="")
-                    if pred_f == canon_f:
-                        print(f" → FA", end="")
-                    else:
-                        print(f" → TR", end="")
-                print()
-            break  # only first utterance
+
             model_accepted  = (pred_f  == canon_f)
             speaker_correct = (human_f == canon_f)
-            
+
             if speaker_correct and model_accepted:
                 cnt.TA += 1
             elif (not speaker_correct) and model_accepted:
@@ -653,7 +634,6 @@ def count_phonological_mdd(
                     cnt.TR_DE += 1
 
     return phon_counts
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Accumulator
