@@ -609,20 +609,37 @@ def count_phonological_mdd(
             else:
                 pred_aligned[i, f_idx] = int(val)
 
+    _printed_first_utt = False
     # ── Evaluate: position-first, then feature ────────────────────────────────
     for i in range(n):
         human_vec = None if human_missing[i] else human_feats[i]
-
+        
         for f_idx, feat_name in enumerate(PHONOLOGICAL_FEATURES):
             cnt = phon_counts.counts[feat_name]
 
             canon_f = int(canon_feats[i, f_idx])
             human_f = None if human_vec is None else int(human_vec[f_idx])
             pred_f  = None if pred_missing[i, f_idx] else int(pred_aligned[i, f_idx])
-
+            # In count_phonological_mdd, inside the evaluation loop, add after building pred_matrix_aligned:
+            # Print first utterance details for feature 'voiced' (index 34)
+            f_idx = 34  # voiced
+            print("voiced feature comparison (first 10 positions):")
+            for i in range(min(10, n)):
+                pred_f = None if pred_missing[i, f_idx] else int(pred_aligned[i, f_idx])
+                human_f = None if human_missing[i] else int(human_feats[i, f_idx])
+                canon_f = int(canon_feats[i, f_idx])
+                print(f"  pos {i}: canon={canon_f} human={human_f} pred={pred_f} | ", end="")
+                if human_f != canon_f:
+                    print(f"MISPRONOUNCED", end="")
+                    if pred_f == canon_f:
+                        print(f" → FA", end="")
+                    else:
+                        print(f" → TR", end="")
+                print()
+            break  # only first utterance
             model_accepted  = (pred_f  == canon_f)
             speaker_correct = (human_f == canon_f)
-
+            
             if speaker_correct and model_accepted:
                 cnt.TA += 1
             elif (not speaker_correct) and model_accepted:
