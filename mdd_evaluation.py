@@ -575,6 +575,11 @@ def count_phonological_mdd(
     # ── Build canonical and human feature matrices (N, 35) ───────────────────
     canon_feats = np.stack([_phoneme_to_binary_array(ph) for ph in canonical])  # (N, 35)
 
+    # Add this diagnostic at the top of count_phonological_mdd, after building canon_feats
+    pred_feature_seqs = _decode_sctcSB_logits_to_feature_sequences(predicted_logits)
+    print(f"N canonical phonemes: {n}")
+    print(f"U_f collapsed lengths: {[len(s) for s in pred_feature_seqs[:5]]}")  # first 5 features
+    print(f"Canon feature sums (first 5): {[int(canon_feats[:, f].sum()) for f in range(5)]}")
     paired_human  = _zip_to_canonical(canonical, human)
     human_feats   = np.zeros((n, NUM_FEATURES), dtype=np.int8)
     human_missing = np.zeros(n, dtype=bool)
@@ -850,7 +855,8 @@ def _run_phonological_wav2vec2(
     with torch.no_grad():
         outputs = model(inputs.input_values.to(device),
                         inputs.get("attention_mask", None))
-
+    print(f"Has attention_mask: {'attention_mask' in inputs}")
+    
     if isinstance(outputs, (tuple, list)):
         logits, output_lengths = outputs[0], outputs[1]
     elif hasattr(outputs, "logits"):
@@ -866,7 +872,7 @@ def _run_phonological_wav2vec2(
     if output_lengths is not None:
         valid_len = int(output_lengths[0].item())
         logits_np = logits_np[:valid_len]
-
+    
     return logits_np
 
 
