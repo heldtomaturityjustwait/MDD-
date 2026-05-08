@@ -91,9 +91,7 @@ class PhonologicalWav2Vec2(nn.Module):
         CNN encoder to add more variations to the training data."
 
         Wav2Vec2Model natively applies SpecAugment between the CNN encoder
-        and the transformer when mask_time_indices is provided. This is the
-        correct placement — our previous implementation applied masking to
-        last_hidden_state (after the full transformer), which was wrong.
+        and the transformer when mask_time_indices is provided.
 
         Returns:
             logits        : (B, T_frames, 71)  raw logits
@@ -153,7 +151,8 @@ class PhonologicalWav2Vec2(nn.Module):
     @torch.no_grad()
     def decode(
         self,
-        logits: torch.Tensor,    # (B, T, 71) or (T, 71) for single item
+        logits: torch.Tensor,                          # (B, T, 71) or (T, 71) for single item
+        output_lengths: Optional[torch.Tensor] = None, # (B,) valid frame counts
     ) -> list[list[list[int]]]:
         """
         Greedy CTC decoding per category.
@@ -163,6 +162,11 @@ class PhonologicalWav2Vec2(nn.Module):
 
         Paper Section 3.3, Eq. 7:
             h_i(x) = argmax_j y^t_{i,j}
+
+        Args:
+            logits        : (B, T, 71) raw model logits
+            output_lengths: (B,) number of valid (non-padded) frames per item.
+                            If None, all T frames are used (may include padding noise).
 
         Returns:
             decoded: [B][35]  list of decoded label sequences
@@ -175,20 +179,21 @@ class PhonologicalWav2Vec2(nn.Module):
         decoded_batch = []
 
         for b in range(B):
+            valid_T = T if output_lengths is None else int(output_lengths[b].item())
             decoded_features = []
             for feat_idx in range(self.num_features):
                 pos_node = feat_idx
                 neg_node = feat_idx + self.num_features
 
-                # Extract 3-node slice: (T, 3)
+                # Extract 3-node slice over valid frames only: (valid_T, 3)
                 cat_logits = torch.stack([
-                    logits[b, :, pos_node],
-                    logits[b, :, neg_node],
-                    logits[b, :, self.blank_idx],
-                ], dim=-1)  # (T, 3)
+                    logits[b, :valid_T, pos_node],
+                    logits[b, :valid_T, neg_node],
+                    logits[b, :valid_T, self.blank_idx],
+                ], dim=-1)  # (valid_T, 3)
 
                 # Argmax: 0=+att, 1=-att, 2=blank
-                preds = cat_logits.argmax(dim=-1)  # (T,)
+                preds = cat_logits.argmax(dim=-1)  # (valid_T,)
 
                 # CTC collapse: remove blanks and repeated labels
                 collapsed = []

@@ -56,14 +56,14 @@ def feature_idx_to_neg_node(feat_idx: int) -> int:
 # CMU 39-phoneme set  (TIMIT 61→39 reduced set used in the paper)
 # ─────────────────────────────────────────────────────────────────────────────
 CMU_39_PHONEMES = [
-    "aa", "ae", "ah", "aw", "ay",
+    "aa", "ae", "ah", "aw", "ay","ao",
     "b",  "ch", "d",  "dh", "eh",
     "er", "ey", "f",  "g",  "hh",
     "ih", "iy", "jh", "k",  "l",
     "m",  "n",  "ng", "ow", "oy",
     "p",  "r",  "s",  "sh", "t",
     "th", "uh", "uw", "v",  "w",
-    "y",  "z",  "zh", "sil",
+    "y",  "z",  "zh",
 ]
 PHONEME_TO_IDX = {p: i for i, p in enumerate(CMU_39_PHONEMES)}
 NUM_PHONEMES = len(CMU_39_PHONEMES)   # 39
@@ -82,67 +82,57 @@ def _p(features_present: list[str]) -> dict[str, bool]:
 
 PHONEME_FEATURES: dict[str, dict[str, bool]] = {
     # ── Stops ──────────────────────────────────────────────────────────────
-    "p":  _p(["consonant", "stop", "bilabial", "labial", "anterior",
-               "short", "monophthong"]),
+    "p":  _p(["consonant", "stop", "bilabial", "labial", "anterior"]),
     "b":  _p(["consonant", "stop", "bilabial", "labial", "anterior",
-               "voiced", "short", "monophthong"]),
-    "t":  _p(["consonant", "stop", "alveolar", "anterior", "coronal",
-               "short", "monophthong"]),
+               "voiced"]),
+    "t":  _p(["consonant", "stop", "alveolar", "anterior", "coronal"]),
     "d":  _p(["consonant", "stop", "alveolar", "anterior", "coronal",
-               "voiced", "short", "monophthong"]),
-    "k":  _p(["consonant", "stop", "velar", "dorsal", "posterior",
-               "short", "monophthong"]),
+               "voiced"]),
+    "k":  _p(["consonant", "stop", "velar", "dorsal", "posterior"]),
     "g":  _p(["consonant", "stop", "velar", "dorsal", "posterior",
-               "voiced", "short", "monophthong"]),
+               "voiced"]),
 
     # ── Fricatives ─────────────────────────────────────────────────────────
-    "f":  _p(["consonant", "fricative", "continuant", "labial", "anterior",
-               "short", "monophthong"]),
+    "f":  _p(["consonant", "fricative", "continuant", "labial", "anterior"]),
     "v":  _p(["consonant", "fricative", "continuant", "labial", "anterior",
-               "voiced", "short", "monophthong"]),
+               "voiced"]),
     "th": _p(["consonant", "fricative", "continuant", "dental", "anterior",
-               "coronal", "short", "monophthong"]),
+               "coronal"]),
     "dh": _p(["consonant", "fricative", "continuant", "dental", "anterior",
-               "coronal", "voiced", "short", "monophthong"]),
+               "coronal", "voiced"]),
     "s":  _p(["consonant", "fricative", "continuant", "alveolar", "anterior",
-               "coronal", "short", "monophthong"]),
+               "coronal"]),
     "z":  _p(["consonant", "fricative", "continuant", "alveolar", "anterior",
-               "coronal", "voiced", "short", "monophthong"]),
-    "sh": _p(["consonant", "fricative", "continuant", "palatal", "coronal",
-               "short", "monophthong"]),
-    "zh": _p(["consonant", "fricative", "continuant", "palatal", "coronal",
-               "voiced", "short", "monophthong"]),
-    "hh": _p(["consonant", "fricative", "continuant", "glottal",
-               "short", "monophthong"]),
+               "coronal", "voiced"]),
+    "sh": _p(["consonant", "fricative", "continuant", "palatal", "coronal", "posterior", "high"]),
+    "zh": _p(["consonant", "fricative", "continuant", "palatal", "coronal", "posterior", "high","voiced"]),
+    "hh": _p(["consonant", "fricative", "glottal"]),
 
     # ── Affricates ─────────────────────────────────────────────────────────
-    "ch": _p(["consonant", "affricate", "palatal", "coronal",
-               "short", "monophthong"]),
+    "ch": _p(["consonant", "affricate", "palatal", "coronal", "posterior", "high"]),
     "jh": _p(["consonant", "affricate", "palatal", "coronal",
-               "voiced", "short", "monophthong"]),
+               "voiced", "posterior", "high"]),
 
     # ── Nasals ─────────────────────────────────────────────────────────────
     "m":  _p(["consonant", "sonorant", "nasal", "bilabial", "labial",
-               "anterior", "voiced", "short", "monophthong"]),
+               "anterior", "voiced"]),
     "n":  _p(["consonant", "sonorant", "nasal", "alveolar", "anterior",
-               "coronal", "voiced", "short", "monophthong"]),
+               "coronal", "voiced"]),
     "ng": _p(["consonant", "sonorant", "nasal", "velar", "dorsal",
-               "posterior", "voiced", "short", "monophthong"]),
+               "posterior", "voiced"]),
 
     # ── Liquids ────────────────────────────────────────────────────────────
     "l":  _p(["consonant", "sonorant", "approximant", "liquid", "continuant",
-               "alveolar", "anterior", "coronal", "voiced",
-               "short", "monophthong"]),
-    "r":  _p(["consonant", "sonorant", "approximant", "liquid", "continuant",
-               "retroflex", "coronal", "voiced", "short", "monophthong"]),
+               "alveolar", "anterior", "coronal", "voiced"]),
+    "r":  _p(["consonant", "sonorant", "approximant", "liquid", "continuant", "palatal",
+               "retroflex", "coronal", "voiced", "posterior"]),
 
     # ── Semivowels (Glides) ────────────────────────────────────────────────
     "w":  _p(["consonant", "sonorant", "approximant", "semivowel",
-               "continuant", "labial", "velar", "dorsal", "voiced",
-               "round", "short", "monophthong"]),
+               "continuant", "labial", "velar", "voiced",
+               "round"]),
     "y":  _p(["consonant", "sonorant", "approximant", "semivowel",
-               "continuant", "palatal", "dorsal", "voiced",
-               "short", "monophthong"]),
+               "continuant", "palatal", "front", "voiced", "high"]),
 
     # ── Short Monophthong Vowels ───────────────────────────────────────────
     "ih": _p(["vowel", "sonorant", "continuant", "high", "front",
@@ -161,8 +151,10 @@ PHONEME_FEATURES: dict[str, dict[str, bool]] = {
                "voiced", "long", "monophthong"]),
     "aa": _p(["vowel", "sonorant", "continuant", "low", "back",
                "voiced", "long", "monophthong"]),
-    "aw": _p(["vowel", "sonorant", "continuant", "low", "back",  # onset
+    "aw": _p(["vowel", "sonorant", "continuant", "low", "back",  
                "voiced", "long", "diphthong"]),
+    "ao": _p(["vowel", "sonorant", "continuant", "mid", "back", "round", "voiced", 
+              "long","monophthong"]),
     "er": _p(["vowel", "sonorant", "continuant", "mid", "central",
                "retroflex", "voiced", "long", "monophthong"]),
     "uw": _p(["vowel", "sonorant", "continuant", "high", "back",
@@ -184,9 +176,15 @@ PHONEME_FEATURES: dict[str, dict[str, bool]] = {
     "sil": _p([]),   # all features absent; treated as blank during training
 }
 
-# Verify all 39 phonemes are covered
-assert set(PHONEME_FEATURES.keys()) == set(CMU_39_PHONEMES), \
-    f"Missing phonemes: {set(CMU_39_PHONEMES) - set(PHONEME_FEATURES.keys())}"
+# Verify all 39 phonemes are covered.
+# "sil" is intentionally extra — it is a fallback/blank placeholder, not a
+# speech target, so it lives in PHONEME_FEATURES but not in CMU_39_PHONEMES.
+_expected = set(CMU_39_PHONEMES) | {"sil"}
+assert set(PHONEME_FEATURES.keys()) == _expected, (
+    f"Missing from PHONEME_FEATURES : {_expected - set(PHONEME_FEATURES.keys())}\n"
+    f"Unexpected in PHONEME_FEATURES: {set(PHONEME_FEATURES.keys()) - _expected}"
+)
+assert NUM_PHONEMES == 39, f"Expected 39 phonemes, got {NUM_PHONEMES}"
 
 
 def phoneme_to_feature_vector(phoneme: str) -> list[bool]:

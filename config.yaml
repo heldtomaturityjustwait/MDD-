@@ -27,7 +27,7 @@ l2arctic:
   - THV
   - TLV
   test_speakers:
-  - ASI
+  - RRBI
   - YBAA
   - HJK
   - BWC
@@ -48,7 +48,7 @@ training:
   learning_rate: 0.0001
   log_every: 50
   max_grad_norm: 1.0
-  num_epochs: 35
+  num_epochs: 30
   save_every: 5
   use_spec_augment: true
   warmup_ratio: 0.1

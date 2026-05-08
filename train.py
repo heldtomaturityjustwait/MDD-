@@ -123,17 +123,10 @@ def evaluate(model, loader, device, label="Test") -> list:
         input_values   = batch["input_values"].to(device)
         attention_mask = batch["attention_mask"].to(device)
 
-        logits, _ = model(input_values, attention_mask)
-
-        # Diagnostic: blank (node 70) win rate across all 71 nodes globally
-        # Note: this is the global argmax — not the local 3-node argmax used
-        # in decode(). A high rate here does not necessarily mean decode() is
-        # failing. Check avg_hyp_len to confirm decode() output.
-        blank_wins = (logits.argmax(dim=-1) == 70).float().mean().item()
-        total_blank_frac += blank_wins
+        logits, output_lengths = model(input_values, attention_mask)
         n_batches += 1
 
-        decoded = model.decode(logits)
+        decoded = model.decode(logits, output_lengths)
 
         for b, phones in enumerate(batch["actual_phones"]):
             ref_feat = phoneme_sequence_to_feature_sequences(phones)
