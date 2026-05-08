@@ -165,7 +165,7 @@ PHONEME_FEATURES: dict[str, dict[str, bool]] = {
                "voiced", "long", "diphthong"]),
     "ay": _p(["vowel", "sonorant", "continuant", "low", "front",
                "voiced", "long", "diphthong"]),
-    "oy": _p(["vowel", "sonorant", "continuant", "mid", "back",
+    "oy": _p(["vowel", "sonorant", "continuant", "mid", "back", "front",
                "round", "voiced", "long", "diphthong"]),
     "ow": _p(["vowel", "sonorant", "continuant", "mid", "back",
                "round", "voiced", "long", "diphthong"]),
