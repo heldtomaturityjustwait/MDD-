@@ -750,16 +750,23 @@ class MDDEvaluator:
         evaluator = MDDEvaluator()
 
         for ann_file in annotation_dir.glob("*.TextGrid"):
-            canonical, human = parse_annotation_for_mdd(str(ann_file))
+            (human, canonical, pron_errors,
+             exp_trans, act_trans, ori_indx) = parse_annotation_for_mdd(str(ann_file))
             utt_id = ann_file.stem
 
-            # Phoneme-level (Whisper)
-            whisper_phones = _run_whisper(whisper_model, processor, waveform, device)
-            evaluator.add_phoneme_utterance(canonical, human, whisper_phones, utt_id)
+            # Phoneme-level
+            predicted_phones = _run_phoneme_wav2vec2(phoneme_model, feat_extractor, waveform, device)
+            evaluator.add_phoneme_utterance(
+                human, canonical, pron_errors, exp_trans, act_trans, ori_indx,
+                predicted_phones, utt_id,
+            )
 
             # Phonological-level (wav2vec2 SCTC-SB)
-            logits = _run_sctcSB(sctcSB_model, feat_extractor, waveform, device)
-            evaluator.add_phonological_utterance(canonical, human, logits, utt_id)
+            logits = _run_phonological_wav2vec2(phonological_model, feat_extractor, waveform, device)
+            evaluator.add_phonological_utterance(
+                human, canonical, pron_errors, exp_trans, act_trans, ori_indx,
+                logits, utt_id,
+            )
 
         evaluator.print_report()
         evaluator.save_json("mdd_results.json")
@@ -1150,21 +1157,42 @@ if __name__ == "__main__":
     #   pos 2: v   correct (human=v)         → TA if model predicts v, FR if not
     #   pos 3: ey  substitution (human=ay)   → FA if model predicts ey
     #   pos 4: s   deletion (human=None)     → FR if model predicts s, TR if not
-    _canonical = ["ae", "d",  "v",  "ey", "s"]
-    _human     = ["ae", "t",  "v",  "ay", None]
+    # Sanity-check utterance: "tab" with one substitution, one deletion, one addition
+    #   ann idx 0: ae  error=c  exp=ae  act=ae   (correct)
+    #   ann idx 1: d   error=s  exp=d   act=t    (substitution: d→t)
+    #   ann idx 2: v   error=c  exp=v   act=v    (correct)
+    #   ann idx 3: ey  error=s  exp=ey  act=ay   (substitution: ey→ay)
+    #   ann idx 4: s   error=d  exp=s   act=sil  (deletion: speaker omitted s)
+    #   ann idx 5: m   error=a  exp=sil act=m    (addition: speaker added m)
+    #
+    # human    = phones speaker actually said (no deletions, additions included)
+    # ori_indx = maps human position → ann idx
+    _pron_errors = ["c",   "s",  "c",  "s",   "d",   "a"]
+    _exp_trans   = ["ae",  "d",  "v",  "ey",  "s",   "sil"]
+    _act_trans   = ["ae",  "t",  "v",  "ay",  "sil", "m"]
+    _human       = ["ae",  "t",  "v",  "ay",  "m"]   # no deletion, addition included
+    _ori_indx    = [0,     1,    2,    3,     5]      # maps to ann indices
+    _canonical   = [_exp_trans[i] for i in _ori_indx] # ["ae","d","v","ey","sil"]
 
-    print("  Testing count_phoneme_mdd with perfect predicted=canonical ...")
-    ph_result = count_phoneme_mdd(_canonical, _human, _canonical[:])
-    # predicted == canonical everywhere:
-    #   pos 0: ae  human=ae  pred=ae   → TA
-    #   pos 1: d   human=t   pred=d    → FA  (substitution accepted)
-    #   pos 2: v   human=v   pred=v    → TA
-    #   pos 3: ey  human=ay  pred=ey   → FA  (substitution accepted)
-    #   pos 4: s   human=None pred=s   → FA  (del_nodel: speaker deleted,
-    #                                          model still predicted canonical)
-    assert ph_result.TA >= 2, f"Expected TA>=2, got {ph_result.TA}"
-    assert ph_result.FA >= 3, f"Expected FA>=3, got {ph_result.FA}"
-    assert ph_result.FR == 0, f"Expected FR=0, got {ph_result.FR}"
+    # predicted = canonical (model output matches expected, not actual)
+    #   pos 0: human=ae  pred=ae  error=c  → hit+c → TA
+    #   pos 1: human=t   pred=d   error=s  exp=d act=t exp≠act → replace+s(exp≠act) → FA
+    #   pos 2: human=v   pred=v   error=c  → hit+c → TA
+    #   pos 3: human=ay  pred=ey  error=s  exp=ey act=ay exp≠act → replace+s(exp≠act) → FA
+    #   pos 4: human=m   pred=sil error=a  exp=sil → replace+a → TR_DE
+    #   ann idx 4 (d error) unmatched → TR_CD
+    _predicted_canonical = ["ae", "d", "v", "ey", "sil"]
+
+    print("  Testing count_phoneme_mdd with predicted=canonical ...")
+    ph_result = count_phoneme_mdd(
+        _human, _canonical, _pron_errors, _exp_trans, _act_trans, _ori_indx,
+        _predicted_canonical,
+    )
+    assert ph_result.TA    == 2, f"Expected TA=2,    got {ph_result.TA}"
+    assert ph_result.FA    == 2, f"Expected FA=2,    got {ph_result.FA}"
+    assert ph_result.TR_DE == 1, f"Expected TR_DE=1, got {ph_result.TR_DE}"
+    assert ph_result.TR_CD == 1, f"Expected TR_CD=1, got {ph_result.TR_CD}"
+    assert ph_result.FR    == 0, f"Expected FR=0,    got {ph_result.FR}"
     print(f"    TA={ph_result.TA} FA={ph_result.FA} FR={ph_result.FR} "
           f"TR_CD={ph_result.TR_CD} TR_DE={ph_result.TR_DE}  PASSED")
 
