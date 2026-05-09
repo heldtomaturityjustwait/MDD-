@@ -122,47 +122,57 @@ from dataset import normalize_phoneme
 
 logger = logging.getLogger(__name__)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Annotation TextGrid parser — derives BOTH canonical and human sequences
+# Annotation TextGrid parser — matches author's data layout exactly
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_annotation_for_mdd(textgrid_path: str) -> tuple[list[str], list[str]]:
+def parse_annotation_for_mdd(
+    textgrid_path: str,
+) -> tuple[list[str], list[str], list[str], list[str], list[str], list[int]]:
     """
-    Parse an L2-ARCTIC annotation TextGrid and return both the canonical
-    phoneme sequence and the human-annotated (actually spoken) phoneme sequence.
-
-    This is the single source of truth for MDD evaluation. No transcript files
-    or force-aligned textgrid files are used.
+    Parse an L2-ARCTIC annotation TextGrid and return all structures needed
+    for MDD evaluation, matching the author's data layout exactly.
 
     TextGrid phones tier label formats
     -----------------------------------
-      Correct:      "AH1"           canonical = ah,  human = ah
-      Substitution: "DH,D,s"        canonical = dh,  human = d   (what was said)
-      Deletion:     "TH,sil,d"      canonical = th,  human = —   (speaker omitted it)
-      Addition:     "sil,AH,a"      canonical = —,   human = ah  (extra; no canonical slot)
-      Hard error:   "CPL,err,s"     canonical = cpl, human = —   (uninterpretable; skip human)
-      Silence:      ""/"sil"/"sp"   skip entirely
+      Correct:      "AH1"        error='c'  canon=ah   actual=ah
+      Substitution: "DH,D,s"    error='s'  canon=dh   actual=d
+      Deletion:     "TH,sil,d"  error='d'  canon=th   actual=sil (speaker omitted)
+      Addition:     "sil,AH,a"  error='a'  canon=sil  actual=ah  (extra phone)
+      Silence:      ""/"sil"    skip entirely
 
-    Canonical sequence contains the phoneme that was *intended* at each
-    slot (Correct and Substitution and Deletion intervals). Insertions/Additions
-    have no canonical slot and are excluded from the canonical sequence but
-    their pronounced phoneme is appended to the human sequence at the
-    corresponding position.
+    The HUMAN (actual) sequence is the alignment reference — matching the
+    author who aligns model output against what was actually said, then uses
+    error labels to classify outcomes.
+
+    Addition errors ARE included in the human sequence (the speaker produced
+    them), with error='a' in pron_errors and 'sil' in exp_trans.
+
+    Deletion errors are NOT in the human sequence (speaker said nothing),
+    but they remain in pron_errors / exp_trans for the two-pass deletion
+    matching performed in count_*_mdd.
 
     Returns
     -------
-    canonical : list[str]   normalised CMU-39 phonemes, silences removed
-    human     : list[str]   normalised CMU-39 phonemes, silences removed
+    human      : list[str]  phones the speaker actually produced (no deletions,
+                             additions included). CTC alignment reference.
+    canonical  : list[str]  canonical phone per human-sequence position
+                             (exp_trans[ori_indx[i]] for each i).
+    pron_errors: list[str]  per-annotation-interval error type ('c','s','d','a').
+                             Includes deletion intervals absent from human.
+    exp_trans  : list[str]  normalised canonical phone per annotation interval.
+                             'sil' for addition intervals (no canonical phone).
+    act_trans  : list[str]  normalised actual phone per annotation interval.
+                             'sil' for deletion intervals (speaker said nothing).
+    ori_indx   : list[int]  maps human[i] → index in pron_errors/exp_trans/act_trans.
     """
     path = Path(textgrid_path)
     if not path.exists():
-        return [], []
+        return [], [], [], [], [], []
 
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
 
-    # Locate the phones tier
     tier_blocks = re.split(r'item\s*\[\d+\]', content)
     phones_block = None
     for block in tier_blocks:
@@ -170,7 +180,7 @@ def parse_annotation_for_mdd(textgrid_path: str) -> tuple[list[str], list[str]]:
             phones_block = block
             break
     if phones_block is None:
-        return [], []
+        return [], [], [], [], [], []
 
     intervals = re.findall(
         r'intervals\s*\[\d+\].*?xmin\s*=\s*[\d.]+.*?xmax\s*=\s*[\d.]+'
@@ -178,8 +188,12 @@ def parse_annotation_for_mdd(textgrid_path: str) -> tuple[list[str], list[str]]:
         phones_block, re.DOTALL,
     )
 
-    canonical_phones: list[str] = []
-    human_phones:     list[str] = []
+    pron_errors: list[str] = []
+    exp_trans:   list[str] = []
+    act_trans:   list[str] = []
+    human:       list[str] = []
+    ori_indx:    list[int] = []
+    ann_idx = 0
 
     for text in intervals:
         text = text.strip()
@@ -189,55 +203,61 @@ def parse_annotation_for_mdd(textgrid_path: str) -> tuple[list[str], list[str]]:
         parts = [p.strip() for p in text.split(",")]
 
         if len(parts) == 1:
-            # Correct pronunciation — same phoneme in both sequences
             ph = normalize_phoneme(parts[0])
-            if ph != "sil":
-                canonical_phones.append(ph)
-                human_phones.append(ph)
+            if ph == "sil":
+                continue
+            pron_errors.append("c")
+            exp_trans.append(ph)
+            act_trans.append(ph)
+            human.append(ph)
+            ori_indx.append(ann_idx)
+            ann_idx += 1
 
         elif len(parts) == 3:
             canonical_raw, pronounced_raw, error_type = parts
             error_type = error_type.strip().lower()
 
             if error_type == "s":
-                # Substitution — canonical slot exists; speaker said something different
                 canon_ph = normalize_phoneme(canonical_raw)
-                if canon_ph != "sil":
-                    canonical_phones.append(canon_ph)
-
-                    pronounced_clean = pronounced_raw.replace("*", "").strip()
-                    if pronounced_clean.lower() == "err":
-                        # Uninterpretable — treat as deletion on the human side.
-                        # Must still append a placeholder so human stays aligned
-                        # with canonical (one slot per canonical phoneme).
-                        human_phones.append(None)
-                    else:
-                        human_ph = normalize_phoneme(pronounced_clean)
-                        if human_ph != "sil":
-                            human_phones.append(human_ph)
-                        else:
-                            human_phones.append(None)  # sil treated as deletion
+                if canon_ph == "sil":
+                    continue
+                pronounced_clean = pronounced_raw.replace("*", "").strip()
+                act_ph = ("sil" if pronounced_clean.lower() == "err"
+                          else normalize_phoneme(pronounced_clean))
+                pron_errors.append("s")
+                exp_trans.append(canon_ph)
+                act_trans.append(act_ph)
+                if act_ph != "sil":
+                    human.append(act_ph)
+                    ori_indx.append(ann_idx)
+                ann_idx += 1
 
             elif error_type == "d":
-                # Deletion — canonical slot exists; speaker produced nothing.
-                # Must append None to human so it stays length-matched to canonical.
+                # Deletion — kept in pron_errors for two-pass matching,
+                # NOT added to human (speaker said nothing).
                 canon_ph = normalize_phoneme(canonical_raw)
-                if canon_ph != "sil":
-                    canonical_phones.append(canon_ph)
-                    human_phones.append(None)   # ← placeholder keeps sequences aligned
+                if canon_ph == "sil":
+                    continue
+                pron_errors.append("d")
+                exp_trans.append(canon_ph)
+                act_trans.append("sil")
+                ann_idx += 1
 
             elif error_type == "a":
-                # Addition/Insertion — speaker produced an extra phoneme with no
-                # canonical slot. There is no canonical anchor for this phone, so
-                # we cannot include it in the positional alignment at all.
-                # Both canonical_phones and human_phones gain nothing here.
-                # (Including it in human_phones would shift all subsequent positions.)
-                pass
+                # Addition — included in human (speaker said it).
+                pronounced_clean = pronounced_raw.replace("*", "").strip()
+                act_ph = normalize_phoneme(pronounced_clean)
+                if act_ph == "sil":
+                    continue
+                pron_errors.append("a")
+                exp_trans.append("sil")
+                act_trans.append(act_ph)
+                human.append(act_ph)
+                ori_indx.append(ann_idx)
+                ann_idx += 1
 
-        # Intervals with other formats are silently skipped
-
-    return canonical_phones, human_phones
-
+    canonical = [exp_trans[ori_indx[i]] for i in range(len(human))]
+    return human, canonical, pron_errors, exp_trans, act_trans, ori_indx
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Alignment helper
@@ -251,7 +271,6 @@ def _zip_to_canonical(canonical: list, other: list) -> list:
     are filled with None (deletion). Tokens beyond len(canonical) are ignored.
     """
     return [other[i] if i < len(other) else None for i in range(len(canonical))]
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MDD count dataclasses
@@ -329,112 +348,259 @@ class PhonologicalMDDCounts:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Core counting: phoneme-level (Whisper)
+# Core counting: phoneme-level
 # ─────────────────────────────────────────────────────────────────────────────
 
 def count_phoneme_mdd(
-    canonical: list[str],
-    human:     list[str],
-    predicted: list[str],
+    human:       list[str],
+    canonical:   list[str],
+    pron_errors: list[str],
+    exp_trans:   list[str],
+    act_trans:   list[str],
+    ori_indx:    list[int],
+    predicted:   list[str],
 ) -> MDDCounts:
     """
     Phoneme-level MDD counting for a single utterance.
 
-    Alignment strategy
-    ------------------
-    canonical ↔ human:
-        human comes from the annotation and is already length-matched to
-        canonical (one slot per canonical phoneme, None for deletions).
-        Simple zip is correct — no alignment needed.
+    Matches the author's algorithm exactly:
 
-    canonical ↔ predicted:
-        predicted is a CTC-decoded model output that has its own insertions
-        and deletions relative to canonical. Zip alignment would cause every
-        position after an early model deletion/insertion to be wrong.
-        We use Levenshtein alignment instead, which finds the optimal
-        position-to-position mapping and marks unmatched slots as None.
+    Step 1 — Levenshtein-align predicted against HUMAN (actual) sequence.
+    Step 2 — Main loop: classify each (ref_pos, asr_pos, ori_pos) by
+              error type and alignment result.
+    Step 3 — Model insertion loop: insertions adjacent to 'd' errors →
+              FA or TR/DE; all others → FR.
+    Step 4 — Unmatched deletion cleanup: 'd' errors not consumed → TR/CD.
 
-    Scoring per canonical position
-    --------------------------------
-        canonical  human     predicted  → category
-        ─────────  ────────  ─────────  ──────────
-        ae         ae        ae         → TA
-        d          t         d          → FA        (error accepted)
-        v          v         f          → FR        (correct, wrongly rejected)
-        ay         ey        ey         → TR/CD     (detected, correct diagnosis)
-        s          sh        z          → TR/DE     (detected, wrong diagnosis)
-
-    Deletion cases (None = alignment gap, not a silence token):
-        t          None(del) None(del)  → TR/CD     (del_del: both deleted)
-        t          None(del) t          → FA        (del_nodel: model accepted)
-        t          None(del) d          → TR/DE     (del_del1: wrong diagnosis)
-        v          v         None(del)  → FR        (model missed correct phone)
-
-    None is never equal to any real phoneme, so the standard
-    model_accepted / speaker_correct comparisons handle all cases
-    correctly without special-casing, as long as TR/CD is defined as
-    pred == human (both None counts as equal).
+    Classification (asr_evl × error):
+      hit    + c → TA
+      hit    + s → TA if canon==actual, else TR+CD
+      hit    + a → TR+CD
+      replace+ c → FR
+      replace+ s → FR if canon==actual, else FA
+      replace+ a → TR+DE
+      delete + c → FR
+      delete + s → FR if canon==actual, else TR+DE
+      delete + a → FA
     """
     from alignment import levenshtein_alignment
 
     counts = MDDCounts()
+    H = len(human)
+    if H == 0:
+        return counts
 
-    # human is already annotation-aligned: same length as canonical, None for deletions
-    paired_human = _zip_to_canonical(canonical, human)
+    # Step 1: Levenshtein-align predicted against HUMAN
+    _, _, _, ops = levenshtein_alignment(human, predicted)
 
-    # predicted: Levenshtein-align to canonical
-    # ops is list of (op, ref_item, hyp_item) where ref=canonical, hyp=predicted
-    _, _, _, ops = levenshtein_alignment(canonical, predicted)
+    asr_evl     = ["hit"] * H
+    hyp_pos_arr = list(range(H))
+    asr_ins_errors: list[tuple[int, int]] = []
+    hyp_offset  = 0
+    ref_cursor  = 0
 
-    # Build predicted-aligned list from ops: one entry per canonical position.
-    # Insertions (model produced extra phoneme) are skipped — no canonical anchor.
-    # Deletions (model emitted nothing here) → None at that canonical position.
-    # None signals an alignment gap, not a predicted silence token.
-    paired_pred = []
-    for op, ref_ph, hyp_ph in ops:
+    for op, _ref, _hyp in ops:
         if op == "I":
-            continue                   # model insertion — no canonical slot, discard
+            asr_ins_errors.append((ref_cursor, ref_cursor + hyp_offset))
+            for j in range(ref_cursor, H):
+                hyp_pos_arr[j] += 1
+            hyp_offset += 1
         elif op == "D":
-            paired_pred.append(None)   # model deletion — gap in predicted sequence
+            asr_evl[ref_cursor]     = "delete"
+            hyp_pos_arr[ref_cursor] = -1
+            for j in range(ref_cursor + 1, H):
+                hyp_pos_arr[j] -= 1
+            hyp_offset -= 1
+            ref_cursor += 1
         else:
-            paired_pred.append(hyp_ph) # "C" or "S": model produced something here
+            if op == "S":
+                asr_evl[ref_cursor] = "replace"
+            ref_cursor += 1
 
-    # Safety: should match len(canonical) but guard anyway
-    paired_pred = _zip_to_canonical(canonical, paired_pred)
+    # Step 2: main classification loop
+    handeled_del: list[int] = []
 
-    for i, canon_ph in enumerate(canonical):
-        human_ph = paired_human[i]
-        pred_ph  = paired_pred[i]
+    for ref_pos, asr_pos, ori_pos in zip(range(H), hyp_pos_arr, ori_indx):
+        evl   = asr_evl[ref_pos]
+        error = pron_errors[ori_pos]
+        cma   = (exp_trans[ori_pos] == act_trans[ori_pos])  # canon_matches_actual
 
-        # None is never equal to a real phoneme, so these comparisons correctly
-        # treat any None as "not matching" the canonical phoneme.
-        model_accepted  = (pred_ph  == canon_ph)   # False when pred_ph  is None
-        speaker_correct = (human_ph == canon_ph)   # False when human_ph is None
+        if evl == "hit":
+            if error == "c":                         counts.TA    += 1
+            elif error == "s" and cma:               counts.TA    += 1
+            elif error == "s" and not cma:           counts.TR_CD += 1
+            elif error == "a":                       counts.TR_CD += 1
 
-        if speaker_correct and model_accepted:
-            counts.TA += 1
-        elif not speaker_correct and model_accepted:
-            # FA covers: substitution accepted, or deletion accepted (del_nodel)
-            counts.FA += 1
-        elif speaker_correct and not model_accepted:
-            # FR covers: correct phone rejected, or model deleted a correct phone
+        elif evl == "replace":
+            if error == "c":                         counts.FR    += 1
+            elif error == "s" and cma:               counts.FR    += 1
+            elif error == "s" and not cma:           counts.FA    += 1
+            elif error == "a":                       counts.TR_DE += 1
+
+        elif evl == "delete":
+            if error == "c":                         counts.FR    += 1
+            elif error == "s" and cma:               counts.FR    += 1
+            elif error == "s" and not cma:           counts.TR_DE += 1
+            elif error == "a":                       counts.FA    += 1
+
+    # Step 3: model insertion loop
+    for ins_ref_pos, ins_hyp_pos in asr_ins_errors:
+        if ins_ref_pos >= len(ori_indx) or ins_ref_pos == 0:
             counts.FR += 1
+            continue
+        candidate_ann = ori_indx[ins_ref_pos] - 1
+        if (candidate_ann >= 0
+                and candidate_ann < len(pron_errors)
+                and pron_errors[candidate_ann] == "d"
+                and candidate_ann not in handeled_del):
+            handeled_del.append(candidate_ann)
+            deleted_ph  = exp_trans[candidate_ann]
+            inserted_ph = (predicted[ins_hyp_pos]
+                           if ins_hyp_pos < len(predicted) else "sil")
+            if inserted_ph == deleted_ph:  counts.FA    += 1
+            else:                          counts.TR_DE += 1
         else:
-            # Both speaker and model deviated from canonical.
-            # TR/CD when pred matches human — this covers:
-            #   • substitution correctly identified (pred == human phoneme)
-            #   • both speaker and model deleted (pred=None == human=None)
-            # TR/DE otherwise — covers:
-            #   • wrong substitution diagnosis (pred != human)
-            #   • speaker deleted but model predicted something wrong (del_del1)
-            #   • model deleted but speaker substituted
-            if pred_ph == human_ph:   # works for (None == None) and (ph == ph)
-                counts.TR_CD += 1
-            else:
-                counts.TR_DE += 1
+            counts.FR += 1
+
+    # Step 4: unmatched deletion cleanup
+    for ann_i, err in enumerate(pron_errors):
+        if err == "d" and ann_i not in handeled_del:
+            counts.TR_CD += 1
 
     return counts
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core counting: phonological-level (wav2vec2 SCTC-SB)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def count_phonological_mdd(
+    human:            list[str],
+    canonical:        list[str],
+    pron_errors:      list[str],
+    exp_trans:        list[str],
+    act_trans:        list[str],
+    ori_indx:         list[int],
+    predicted_logits: np.ndarray,
+) -> PhonologicalMDDCounts:
+    """
+    Phonological feature-level MDD counting for a single utterance.
+
+    Same four-step algorithm as count_phoneme_mdd, applied independently
+    for each of the 35 features.
+
+    For each feature f:
+      1. CTC-collapse logits → binary sequence (U_f values, 0 or 1).
+      2. Levenshtein-align U_f against HUMAN feature binary sequence (H values).
+      3. Classify using error type and alignment result.
+      4. Unmatched deletion cleanup.
+
+    canon_matches_actual_f = (feature value of exp_trans[ori_pos]
+                               == feature value of act_trans[ori_pos])
+    """
+    from alignment import levenshtein_alignment
+
+    phon_counts = PhonologicalMDDCounts()
+    H = len(human)
+    if H == 0:
+        return phon_counts
+
+    pred_feature_seqs = _decode_sctcSB_logits_to_feature_sequences(predicted_logits)
+    human_feats = np.stack([_phoneme_to_binary_array(ph) for ph in human])   # (H, 35)
+
+    n_ann = len(pron_errors)
+    canon_feats_by_ori  = np.zeros((n_ann, NUM_FEATURES), dtype=np.int8)
+    actual_feats_by_ori = np.zeros((n_ann, NUM_FEATURES), dtype=np.int8)
+    for ann_i in range(n_ann):
+        canon_feats_by_ori[ann_i]  = _phoneme_to_binary_array(exp_trans[ann_i])
+        actual_feats_by_ori[ann_i] = _phoneme_to_binary_array(act_trans[ann_i])
+
+    for f_idx, feat_name in enumerate(PHONOLOGICAL_FEATURES):
+        cnt = phon_counts.counts[feat_name]
+
+        human_binary = human_feats[:, f_idx].astype(int).tolist()
+        pred_binary  = pred_feature_seqs[f_idx]
+
+        # Step 1: align predicted against HUMAN feature sequence
+        _, _, _, ops = levenshtein_alignment(human_binary, pred_binary)
+
+        asr_evl     = ["hit"] * H
+        hyp_pos_arr = list(range(H))
+        asr_ins_errors_f: list[tuple[int, int]] = []
+        hyp_offset  = 0
+        ref_cursor  = 0
+
+        for op, _ref, _hyp in ops:
+            if op == "I":
+                asr_ins_errors_f.append((ref_cursor, ref_cursor + hyp_offset))
+                for j in range(ref_cursor, H):
+                    hyp_pos_arr[j] += 1
+                hyp_offset += 1
+            elif op == "D":
+                asr_evl[ref_cursor]     = "delete"
+                hyp_pos_arr[ref_cursor] = -1
+                for j in range(ref_cursor + 1, H):
+                    hyp_pos_arr[j] -= 1
+                hyp_offset -= 1
+                ref_cursor += 1
+            else:
+                if op == "S":
+                    asr_evl[ref_cursor] = "replace"
+                ref_cursor += 1
+
+        # Step 2: main classification loop
+        handeled_del_f: list[int] = []
+
+        for ref_pos, asr_pos, ori_pos in zip(range(H), hyp_pos_arr, ori_indx):
+            evl   = asr_evl[ref_pos]
+            error = pron_errors[ori_pos]
+            cf    = int(canon_feats_by_ori[ori_pos, f_idx])
+            af    = int(actual_feats_by_ori[ori_pos, f_idx])
+            cma   = (cf == af)   # canon_matches_actual for this feature
+
+            if evl == "hit":
+                if error == "c":                     cnt.TA    += 1
+                elif error == "s" and cma:           cnt.TA    += 1
+                elif error == "s" and not cma:       cnt.TR_CD += 1
+                elif error == "a":                   cnt.TR_CD += 1
+
+            elif evl == "replace":
+                if error == "c":                     cnt.FR    += 1
+                elif error == "s" and cma:           cnt.FR    += 1
+                elif error == "s" and not cma:       cnt.FA    += 1
+                elif error == "a":                   cnt.TR_DE += 1
+
+            elif evl == "delete":
+                if error == "c":                     cnt.FR    += 1
+                elif error == "s" and cma:           cnt.FR    += 1
+                elif error == "s" and not cma:       cnt.TR_DE += 1
+                elif error == "a":                   cnt.FA    += 1
+
+        # Step 3: model insertion loop
+        for ins_ref_pos, ins_hyp_pos in asr_ins_errors_f:
+            if ins_ref_pos >= len(ori_indx) or ins_ref_pos == 0:
+                cnt.FR += 1
+                continue
+            candidate_ann = ori_indx[ins_ref_pos] - 1
+            if (candidate_ann >= 0
+                    and candidate_ann < len(pron_errors)
+                    and pron_errors[candidate_ann] == "d"
+                    and candidate_ann not in handeled_del_f):
+                handeled_del_f.append(candidate_ann)
+                deleted_f  = int(canon_feats_by_ori[candidate_ann, f_idx])
+                inserted_f = (pred_binary[ins_hyp_pos]
+                              if ins_hyp_pos < len(pred_binary) else -1)
+                if inserted_f == deleted_f:  cnt.FA    += 1
+                else:                        cnt.TR_DE += 1
+            else:
+                cnt.FR += 1
+
+        # Step 4: unmatched deletion cleanup
+        for ann_i, err in enumerate(pron_errors):
+            if err == "d" and ann_i not in handeled_del_f:
+                cnt.TR_CD += 1
+
+    return phon_counts
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core counting: phonological-level (wav2vec2 SCTC-SB)
@@ -572,133 +738,6 @@ def _align_binary_to_canonical(
     # Safety pad/trim in case levenshtein_alignment output length drifts
     return _zip_to_canonical(canonical_binary, aligned)
 
-
-def count_phonological_mdd(
-    canonical:        list[str],
-    human:            list[str],
-    predicted_logits: np.ndarray,
-) -> PhonologicalMDDCounts:
-    """
-    Phonological feature-level MDD counting for a single utterance.
-
-    Decoding
-    --------
-    logits (T, 71) → per-feature CTC collapse → 35 binary sequences, each of
-    length U_f ≤ T. The shared blank node (index 70) means blank fires at the
-    same frames for all features, so U_f is typically the same across features,
-    but alignment is done per-feature so any divergence is handled safely.
-
-    Alignment
-    ---------
-    Each of the 35 feature sequences (length U_f) is independently
-    Levenshtein-aligned to its canonical binary sequence (length N). This
-    correctly handles U_f ≠ N: model insertions are discarded (no canonical
-    anchor), model deletions become None at that canonical position.
-
-    A single zip over 35 feature sequences (the old approach) silently
-    misaligned everything whenever U ≠ N, because a short predicted sequence
-    would leave the tail of canonical positions as None even though the model
-    did produce tokens — they just didn't get mapped to the right slots.
-
-    Evaluation
-    ----------
-    At each canonical position i and each feature f:
-      canon_f  — 0/1 from PHONEME_FEATURES[canonical[i]]
-      human_f  — 0/1 from PHONEME_FEATURES[human[i]], or None (speaker deletion)
-      pred_f   — 0/1 from Levenshtein-aligned prediction, or None (model deletion)
-
-    Classify as TA / FA / FR / TR_CD / TR_DE exactly as in phoneme-level MDD.
-
-    Example: canonical /s/ mispronounced as /z/ by speaker, model predicts /z/.
-      canon_vec = [..., voiced=0, ...]
-      human_vec = [..., voiced=1, ...]
-      pred_vec  = [..., voiced=1, ...]
-      → voiced feature: TR_CD  (detected, correctly diagnosed)
-      → all other features: TA  (model agrees with both canonical and human)
-    """
-    phon_counts = PhonologicalMDDCounts()
-    n = len(canonical)
-    if n == 0:
-        return phon_counts
-
-    # ── Build canonical and human feature matrices (N, 35) ───────────────────
-    canon_feats = np.stack([_phoneme_to_binary_array(ph) for ph in canonical])  # (N, 35)
-
-    paired_human  = _zip_to_canonical(canonical, human)
-    human_feats   = np.zeros((n, NUM_FEATURES), dtype=np.int8)
-    human_missing = np.zeros(n, dtype=bool)
-    for i, human_ph in enumerate(paired_human):
-        if human_ph is None:
-            human_missing[i] = True
-        else:
-            human_feats[i] = _phoneme_to_binary_array(human_ph)
-
-    # ── Decode logits → 35 CTC-collapsed binary sequences ────────────────────
-    pred_feature_seqs = _decode_sctcSB_logits_to_feature_sequences(predicted_logits)
-    # pred_feature_seqs: list[35][U_f], values 1 (+att) or 0 (-att)
-
-    # ── Per-feature Levenshtein alignment → (N, 35) prediction matrix ────────
-    # Each feature has its own collapsed length U_f. Aligning independently
-    # ensures model tokens land on the right canonical slot even when U_f ≠ N.
-    pred_aligned  = np.zeros((n, NUM_FEATURES), dtype=np.int8)
-    pred_missing  = np.zeros((n, NUM_FEATURES), dtype=bool)
-
-    for f_idx in range(NUM_FEATURES):
-        canon_binary = canon_feats[:, f_idx].astype(int).tolist()  # length N, values 0/1
-        pred_binary  = pred_feature_seqs[f_idx]                    # length U_f, values 0/1
-        aligned = _align_binary_to_canonical(canon_binary, pred_binary)
-        for i, val in enumerate(aligned):
-            if val is None:
-                pred_missing[i, f_idx] = True
-            else:
-                pred_aligned[i, f_idx] = int(val)
-
-    # ── Evaluate: position-first, then feature ────────────────────────────────
-    for i in range(n):
-        human_vec = None if human_missing[i] else human_feats[i]
-
-        for f_idx, feat_name in enumerate(PHONOLOGICAL_FEATURES):
-            cnt = phon_counts.counts[feat_name]
-
-            canon_f = int(canon_feats[i, f_idx])
-            human_f = None if human_vec is None else int(human_vec[f_idx])
-            pred_f  = None if pred_missing[i, f_idx] else int(pred_aligned[i, f_idx])
-
-            # None is never equal to 0 or 1, so these comparisons correctly
-            # treat any None as "not matching" the canonical feature value.
-            model_accepted  = (pred_f  == canon_f)   # False when pred_f  is None
-            speaker_correct = (human_f == canon_f)   # False when human_f is None
-
-            if speaker_correct and model_accepted:
-                cnt.TA += 1
-            elif not speaker_correct and model_accepted:
-                # FA covers: feature substituted and accepted, or
-                # speaker-deleted feature accepted (del_nodel equivalent)
-                cnt.FA += 1
-            elif speaker_correct and not model_accepted:
-                # FR covers: correct feature wrongly rejected, or
-                # model failed to emit a token for a correctly-spoken slot
-                cnt.FR += 1
-            else:
-                # Both speaker and model deviated from canonical.
-                # TR/CD when pred matches human — covers:
-                #   • substitution correctly identified (pred == human value)
-                #   • both speaker and model deleted (pred=None == human=None)
-                # TR/DE otherwise — covers:
-                #   • wrong feature value predicted (pred != human value)
-                #   • speaker deleted but model predicted wrong value (del_del1)
-                #   • model deleted but speaker substituted a different value
-                if pred_f == human_f:   # works for (None == None) and (0/1 == 0/1)
-                    cnt.TR_CD += 1
-                else:
-                    cnt.TR_DE += 1
-
-    return phon_counts
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Accumulator
-# ─────────────────────────────────────────────────────────────────────────────
-
 class MDDEvaluator:
     """
     Accumulates MDD counts across utterances and computes final metrics.
@@ -734,30 +773,40 @@ class MDDEvaluator:
 
     def add_phoneme_utterance(
         self,
-        canonical: list[str],
-        human:     list[str],
-        predicted: list[str],
-        utt_id:    Optional[str] = None,
+        human:       list[str],
+        canonical:   list[str],
+        pron_errors: list[str],
+        exp_trans:   list[str],
+        act_trans:   list[str],
+        ori_indx:    list[int],
+        predicted:   list[str],
+        utt_id:      Optional[str] = None,
     ) -> MDDCounts:
-        """Add one utterance to the Whisper (phoneme-level) accumulator."""
-        if not canonical:
-            logger.warning(f"[{utt_id}] empty canonical sequence, skipping")
+        """Add one utterance to the phoneme-level accumulator."""
+        if not human:
+            logger.warning(f"[{utt_id}] empty human sequence, skipping")
             return MDDCounts()
-        utt_counts = count_phoneme_mdd(canonical, human, predicted)
+        utt_counts = count_phoneme_mdd(
+            human, canonical, pron_errors, exp_trans, act_trans, ori_indx, predicted
+        )
         self.phoneme_counts = self.phoneme_counts + utt_counts
         self.n_phoneme_utts += 1
         return utt_counts
 
     def add_phonological_utterance(
         self,
-        canonical:        list[str],
         human:            list[str],
+        canonical:        list[str],
+        pron_errors:      list[str],
+        exp_trans:        list[str],
+        act_trans:        list[str],
+        ori_indx:         list[int],
         predicted_logits: np.ndarray,
         utt_id:           Optional[str] = None,
     ) -> PhonologicalMDDCounts:
-        """Add one utterance to the wav2vec2 SCTC-SB (phonological-level) accumulator."""
-        if not canonical:
-            logger.warning(f"[{utt_id}] empty canonical sequence, skipping")
+        """Add one utterance to the phonological-level (SCTC-SB) accumulator."""
+        if not human:
+            logger.warning(f"[{utt_id}] empty human sequence, skipping")
             return PhonologicalMDDCounts()
         if predicted_logits.ndim != 2 or predicted_logits.shape[1] not in (
             NUM_FEATURES, NUM_OUTPUT_NODES
@@ -766,7 +815,9 @@ class MDDEvaluator:
                 f"[{utt_id}] predicted_logits must be (T, {NUM_FEATURES}) "
                 f"or (T, {NUM_OUTPUT_NODES}), got {predicted_logits.shape}"
             )
-        utt_counts = count_phonological_mdd(canonical, human, predicted_logits)
+        utt_counts = count_phonological_mdd(
+            human, canonical, pron_errors, exp_trans, act_trans, ori_indx, predicted_logits
+        )
         self.phonological_counts.add(utt_counts)
         self.n_phonological_utts += 1
         return utt_counts
@@ -933,7 +984,6 @@ def _run_phonological_wav2vec2(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Full corpus evaluation loop
-# ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_mdd(
     l2arctic_root:        str,
@@ -1012,13 +1062,9 @@ def evaluate_mdd(
                 print(f"  [{spk}] {ann_idx + 1}/{len(ann_files)}  {utt_id}")
 
             # ── 1. Canonical + Human: both from annotation TextGrid ───────
-            canonical, human = parse_annotation_for_mdd(str(ann_file))
-            if not canonical:
-                logger.warning(f"[{utt_id}] no canonical phones from annotation, skipping")
-                n_skipped += 1
-                continue
-            # human can contain None entries (deletions) — only skip if list itself is empty
-            if len(human) == 0:
+            (human, canonical, pron_errors,
+             exp_trans, act_trans, ori_indx) = parse_annotation_for_mdd(str(ann_file))
+            if not human:
                 logger.warning(f"[{utt_id}] no human phones from annotation, skipping")
                 n_skipped += 1
                 continue
@@ -1041,7 +1087,8 @@ def evaluate_mdd(
                         phoneme_model, feature_extractor, waveform, device
                     )
                     evaluator.add_phoneme_utterance(
-                        canonical, human, predicted_phones, utt_id
+                        human, canonical, pron_errors, exp_trans,
+                        act_trans, ori_indx, predicted_phones, utt_id
                     )
                 except Exception as e:
                     logger.warning(f"[{utt_id}] phoneme model inference error: {e}")
@@ -1053,7 +1100,8 @@ def evaluate_mdd(
                         phonological_model, feature_extractor, waveform, device
                     )
                     evaluator.add_phonological_utterance(
-                        canonical, human, logits, utt_id
+                        human, canonical, pron_errors, exp_trans,
+                        act_trans, ori_indx, logits, utt_id
                     )
                 except Exception as e:
                     logger.warning(f"[{utt_id}] phonological model inference error: {e}")
