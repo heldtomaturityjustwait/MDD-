@@ -94,10 +94,8 @@ PHONEME_FEATURES: dict[str, dict[str, bool]] = {
  
     # ── Fricatives ─────────────────────────────────────────────────────────
     
-    "f":  _p(["consonant", "fricative", "continuant", "labial", "anterior",
-               "coronal"]),
-    "v":  _p(["consonant", "fricative", "continuant", "labial", "anterior",
-               "coronal", "voiced"]),
+    "f":  _p(["consonant", "fricative", "continuant", "labial", "anterior"]),
+    "v":  _p(["consonant", "fricative", "continuant", "labial", "anterior", "voiced"]),
     "th": _p(["consonant", "fricative", "continuant", "dental", "anterior",
                "coronal"]),
     "dh": _p(["consonant", "fricative", "continuant", "dental", "anterior",

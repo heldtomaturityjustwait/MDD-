@@ -695,58 +695,6 @@ def _decode_sctcSB_logits_to_feature_sequences(logits: np.ndarray) -> list[list[
     )
 
 
-def _align_binary_to_canonical(
-    canonical_binary: list[int],
-    predicted_binary: list[int],
-) -> list:
-    """
-    Levenshtein-align a CTC-collapsed binary sequence to the canonical binary
-    sequence for one feature.
-
-    Args:
-        canonical_binary : length-N list of 0/1 values derived from the
-                           canonical phoneme sequence for one feature.
-        predicted_binary : length-U list of 0/1 values from CTC collapse
-                           for the same feature (U may differ from N).
-
-    Returns:
-        List of length N. Each element is:
-            0 or 1  — model's aligned prediction at that canonical position
-            None    — model deletion (no predicted token mapped here)
-
-    Why Levenshtein and not zip?
-        After CTC collapse U ≤ T, but U is almost never equal to N. If you
-        zip a length-5 predicted sequence onto a length-7 canonical sequence,
-        the last two canonical positions silently get None (treated as model
-        deletions) even though the model did produce tokens — they just
-        weren't aligned correctly. Levenshtein finds the optimal token-to-token
-        mapping so each model token lands on the right canonical slot.
-
-    Note on binary Levenshtein:
-        Aligning 0/1 sequences is meaningful here because each value is
-        anchored to a phoneme slot by the CTC collapse: the first 1 in the
-        predicted sequence corresponds to the first +att phoneme the model
-        decided to emit, not just any frame that happened to fire +att.
-        The alignment matches predicted phoneme slots to canonical phoneme
-        slots, using the feature value only to distinguish substitutions from
-        correct predictions — it does not match arbitrary same-valued frames.
-    """
-    from alignment import levenshtein_alignment
-
-    _, _, _, ops = levenshtein_alignment(canonical_binary, predicted_binary)
-
-    aligned: list = []
-    for op, _ref_val, hyp_val in ops:
-        if op == "I":
-            continue               # model insertion — no canonical anchor, discard
-        elif op == "D":
-            aligned.append(None)   # model deletion — canonical slot has no prediction
-        else:                      # "C" (match) or "S" (substitution)
-            aligned.append(hyp_val)
-
-    # Safety pad/trim in case levenshtein_alignment output length drifts
-    return _zip_to_canonical(canonical_binary, aligned)
-
 class MDDEvaluator:
     """
     Accumulates MDD counts across utterances and computes final metrics.
