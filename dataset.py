@@ -639,16 +639,29 @@ class SuitcaseDataset(Dataset):
 
 def make_collate_fn(processor):
     """
-    Factory that returns a collate_fn with a Wav2Vec2Processor bound to it.
+    Factory that returns a collate_fn with a feature extractor bound to it.
 
-    The processor handles two things that we previously did manually:
+    Accepts either a Wav2Vec2FeatureExtractor or a Wav2Vec2Processor —
+    both expose the same __call__ interface for audio input.
+    wav2vec2-large-robust ships without a tokenizer, so train.py passes
+    a Wav2Vec2FeatureExtractor directly; this is fine for audio processing.
+
+    NOTE: return_attention_mask=True is passed explicitly below.
+    wav2vec2-large-robust's feature extractor config defaults to
+    return_attention_mask=False, which means attention_mask would be None
+    without this override. A None attention_mask causes _get_feat_extract_
+    output_lengths to treat all frames (including padding) as valid,
+    producing wrong input_lengths for CTC and corrupting the loss.
+
+    The feature extractor handles:
       1. Normalization — zero-mean, unit-variance per waveform
          (required because wav2vec2 was pretrained on normalized audio)
       2. Padding + attention_mask — pads all waveforms in the batch to
-         the same length and returns a boolean mask
+         the same length and returns a mask (1=real audio, 0=padding)
 
     Args:
-        processor: Wav2Vec2Processor loaded from the same pretrained model
+        processor: Wav2Vec2FeatureExtractor (or Wav2Vec2Processor) loaded
+                   from the pretrained model checkpoint
 
     Returns:
         collate_fn(batch) → dict with keys:
@@ -677,8 +690,11 @@ def make_collate_fn(processor):
             raw_waveforms,
             sampling_rate=16000,
             return_tensors="pt",
-            padding=True,          # pad shorter sequences to longest
-        )
+            padding=True,               # pad shorter sequences to longest
+            return_attention_mask=True, # required: wav2vec2-large-robust has
+        )                               # return_attention_mask=False by default;
+                                        # without this, attention_mask is None
+                                        # and padding frames corrupt output lengths
         # processed.input_values  : (B, T_max)  normalized + padded
         # processed.attention_mask: (B, T_max)  1=real, 0=padding
 
