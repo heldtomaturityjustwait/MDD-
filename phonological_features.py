@@ -82,20 +82,22 @@ def _p(features_present: list[str]) -> dict[str, bool]:
 
 PHONEME_FEATURES: dict[str, dict[str, bool]] = {
     # ── Stops ──────────────────────────────────────────────────────────────
-    "p":  _p(["consonant", "stop", "bilabial", "labial", "anterior"]),
-    "b":  _p(["consonant", "stop", "bilabial", "labial", "anterior",
+    "p":  _p(["consonant", "stop", "labial", "anterior", "bilabial"]),
+    "b":  _p(["consonant", "stop", "labial", "anterior", "bilabial",
                "voiced"]),
     "t":  _p(["consonant", "stop", "alveolar", "anterior", "coronal"]),
     "d":  _p(["consonant", "stop", "alveolar", "anterior", "coronal",
                "voiced"]),
-    "k":  _p(["consonant", "stop", "velar", "dorsal", "posterior"]),
-    "g":  _p(["consonant", "stop", "velar", "dorsal", "posterior",
+    "k":  _p(["consonant", "stop", "velar", "posterior", "dorsal"]),
+    "g":  _p(["consonant", "stop", "velar", "posterior", "dorsal",
                "voiced"]),
-
+ 
     # ── Fricatives ─────────────────────────────────────────────────────────
-    "f":  _p(["consonant", "fricative", "continuant", "labial", "anterior"]),
+    
+    "f":  _p(["consonant", "fricative", "continuant", "labial", "anterior",
+               "coronal"]),
     "v":  _p(["consonant", "fricative", "continuant", "labial", "anterior",
-               "voiced"]),
+               "coronal", "voiced"]),
     "th": _p(["consonant", "fricative", "continuant", "dental", "anterior",
                "coronal"]),
     "dh": _p(["consonant", "fricative", "continuant", "dental", "anterior",
@@ -104,72 +106,89 @@ PHONEME_FEATURES: dict[str, dict[str, bool]] = {
                "coronal"]),
     "z":  _p(["consonant", "fricative", "continuant", "alveolar", "anterior",
                "coronal", "voiced"]),
-    "sh": _p(["consonant", "fricative", "continuant", "palatal", "coronal", "posterior", "high"]),
-    "zh": _p(["consonant", "fricative", "continuant", "palatal", "coronal", "posterior", "high","voiced"]),
-    "hh": _p(["consonant", "fricative", "glottal"]),
 
-    # ── Affricates ─────────────────────────────────────────────────────────
-    "ch": _p(["consonant", "affricate", "palatal", "coronal", "posterior", "high"]),
-    "jh": _p(["consonant", "affricate", "palatal", "coronal",
-               "voiced", "posterior", "high"]),
+    "sh": _p(["consonant", "fricative", "continuant", "palatal", "posterior",
+               "coronal"]),
 
-    # ── Nasals ─────────────────────────────────────────────────────────────
-    "m":  _p(["consonant", "sonorant", "nasal", "bilabial", "labial",
-               "anterior", "voiced"]),
-    "n":  _p(["consonant", "sonorant", "nasal", "alveolar", "anterior",
+    "zh": _p(["consonant", "fricative", "continuant", "palatal", "posterior",
                "coronal", "voiced"]),
-    "ng": _p(["consonant", "sonorant", "nasal", "velar", "dorsal",
-               "posterior", "voiced"]),
-
+    
+    "hh": _p(["consonant", "fricative", "continuant", "glottal", "posterior",
+               "dorsal"]),
+ 
+    # ── Affricates ─────────────────────────────────────────────────────────
+    
+    "ch": _p(["consonant", "affricate", "palatal", "posterior", "coronal"]),
+    "jh": _p(["consonant", "affricate", "palatal", "posterior", "coronal",
+               "voiced"]),
+ 
+    # ── Nasals ─────────────────────────────────────────────────────────────
+    
+    "m":  _p(["consonant", "sonorant", "nasal", "continuant", "labial",
+               "anterior", "bilabial", "voiced"]),
+    "n":  _p(["consonant", "sonorant", "nasal", "continuant", "alveolar",
+               "anterior", "coronal", "voiced"]),
+    "ng": _p(["consonant", "sonorant", "nasal", "continuant", "velar",
+               "posterior", "dorsal", "voiced"]),
+ 
     # ── Liquids ────────────────────────────────────────────────────────────
     "l":  _p(["consonant", "sonorant", "approximant", "liquid", "continuant",
                "alveolar", "anterior", "coronal", "voiced"]),
-    "r":  _p(["consonant", "sonorant", "approximant", "liquid", "continuant", "palatal",
-               "retroflex", "coronal", "voiced", "posterior"]),
-
+    
+    "r":  _p(["consonant", "sonorant", "approximant", "liquid", "continuant",
+               "alveolar", "anterior", "retroflex", "coronal", "voiced"]),
+ 
     # ── Semivowels (Glides) ────────────────────────────────────────────────
-    "w":  _p(["consonant", "sonorant", "approximant", "semivowel",
-               "continuant", "labial", "velar", "voiced",
-               "round"]),
-    "y":  _p(["consonant", "sonorant", "approximant", "semivowel",
-               "continuant", "palatal", "front", "voiced", "high"]),
 
+    "w":  _p(["sonorant", "approximant", "semivowel", "continuant", "labial",
+               "high", "anterior", "bilabial", "round", "voiced"]),
+    "y":  _p(["sonorant", "approximant", "semivowel", "continuant", "palatal",
+               "high", "posterior", "coronal", "voiced"]),
+ 
     # ── Short Monophthong Vowels ───────────────────────────────────────────
-    "ih": _p(["vowel", "sonorant", "continuant", "high", "front",
-               "voiced", "short", "monophthong"]),
-    "eh": _p(["vowel", "sonorant", "continuant", "mid", "front",
-               "voiced", "short", "monophthong"]),
-    "ae": _p(["vowel", "sonorant", "continuant", "low", "front",
-               "voiced", "short", "monophthong"]),
-    "ah": _p(["vowel", "sonorant", "continuant", "mid", "central",
-               "voiced", "short", "monophthong"]),
-    "uh": _p(["vowel", "sonorant", "continuant", "high", "back",
-               "round", "voiced", "short", "monophthong"]),
+    "ih": _p(["sonorant", "vowel", "continuant", "high", "front",
+               "short", "monophthong", "voiced"]),
 
+    "eh": _p(["sonorant", "vowel", "mid", "front",
+               "short", "monophthong", "voiced"]),
+
+    "ae": _p(["sonorant", "vowel", "continuant", "low", "front",
+               "long", "monophthong", "voiced"]),
+
+    "ah": _p(["sonorant", "vowel", "continuant", "mid", "back",
+               "short", "monophthong", "voiced"]),
+
+    "uh": _p(["sonorant", "vowel", "continuant", "high", "back",
+               "short", "monophthong", "round", "voiced"]),
+ 
     # ── Long Monophthong Vowels ────────────────────────────────────────────
-    "iy": _p(["vowel", "sonorant", "continuant", "high", "front",
-               "voiced", "long", "monophthong"]),
-    "aa": _p(["vowel", "sonorant", "continuant", "low", "back",
-               "voiced", "long", "monophthong"]),
-    "aw": _p(["vowel", "sonorant", "continuant", "low", "back",  
-               "voiced", "long", "diphthong"]),
-    "ao": _p(["vowel", "sonorant", "continuant", "mid", "back", "round", "voiced", 
-              "long","monophthong"]),
-    "er": _p(["vowel", "sonorant", "continuant", "mid", "central",
-               "retroflex", "voiced", "long", "monophthong"]),
-    "uw": _p(["vowel", "sonorant", "continuant", "high", "back",
-               "round", "voiced", "long", "monophthong"]),
-
+    "iy": _p(["sonorant", "vowel", "continuant", "high", "front",
+               "long", "monophthong", "voiced"]),
+    "aa": _p(["sonorant", "vowel", "continuant", "low", "back",
+               "long", "monophthong", "voiced"]),
+    "ao": _p(["sonorant", "vowel", "continuant", "mid", "back",
+               "long", "monophthong", "round", "voiced"]),
+    "er": _p(["sonorant", "vowel", "continuant", "mid", "central",
+               "retroflex", "short", "monophthong", "voiced"]),
+    "uw": _p(["sonorant", "vowel", "continuant", "high", "back",
+               "long", "monophthong", "round", "voiced"]),
+ 
     # ── Diphthongs ─────────────────────────────────────────────────────────
-    "ey": _p(["vowel", "sonorant", "continuant", "mid", "front",
-               "voiced", "long", "diphthong"]),
-    "ay": _p(["vowel", "sonorant", "continuant", "low", "front",
-               "voiced", "long", "diphthong"]),
-    "oy": _p(["vowel", "sonorant", "continuant", "mid", "back", "front",
-               "round", "voiced", "long", "diphthong"]),
-    "ow": _p(["vowel", "sonorant", "continuant", "mid", "back",
-               "round", "voiced", "long", "diphthong"]),
+    "ey": _p(["sonorant", "vowel", "continuant", "mid", "front",
+               "long", "diphthong", "voiced"]),
 
+    "aw": _p(["sonorant", "vowel", "continuant", "low", "central",
+               "long", "diphthong", "round", "voiced"]),
+
+    "ay": _p(["sonorant", "vowel", "low", "central",
+               "long", "diphthong", "voiced"]),
+
+    "oy": _p(["sonorant", "vowel", "continuant", "mid", "back",
+               "long", "diphthong", "round", "voiced"]),
+
+    "ow": _p(["sonorant", "vowel", "continuant", "mid", "central",
+               "long", "diphthong", "round", "voiced"]),
+ 
     # ── Silence ────────────────────────────────────────────────────────────
     # Paper: "All silence labels were further removed leaving silence frames
     # to be handled by the blank label."
