@@ -19,7 +19,35 @@ MDD categories (per canonical position):
   FA    : predicted == canonical  AND  human != canonical
   FR    : predicted != canonical  AND  human == canonical
   TR/CD : predicted != canonical  AND  human != canonical  AND  predicted == human
-  TR/DE : all three are different
+  TR/DE : predicted != canonical  AND  human != canonical  AND  predicted != human
+
+  None values (deletion gaps from Levenshtein alignment) are treated as
+  distinct from every phoneme/feature value, so:
+
+    human=None means speaker deleted the canonical phoneme.
+    pred=None  means model emitted nothing aligned to this canonical slot.
+
+  None is never equal to a real phoneme/feature value, which gives:
+
+    human == canonical, pred == canonical  → TA   (impossible if pred=None)
+    human != canonical, pred == canonical  → FA   (impossible if pred=None)
+    human == canonical, pred != canonical  → FR   (covers pred=None: model
+                                                    wrongly rejected a correct
+                                                    pronunciation or a deletion
+                                                    the speaker made correctly)
+    human != canonical, pred != canonical:
+      pred == human                        → TR/CD (both speaker and model
+                                                    deleted/substituted the same
+                                                    way; diagnosis correct)
+      pred != human                        → TR/DE (error detected but model
+                                                    output does not match what
+                                                    speaker actually said)
+
+  Concretely, deletion cases follow the same rules as substitutions
+  (mirroring ins_del_sub_cor_analysis.py):
+    human=None, pred=None   → TR/CD  (del_del: both deleted — correct diagnosis)
+    human=None, pred=canon  → FA     (del_nodel: speaker deleted, model accepted)
+    human=None, pred=other  → TR/DE  (del_del1: speaker deleted, model wrong)
 
 The three sequences used for evaluation
 -----------------------------------------
@@ -328,16 +356,24 @@ def count_phoneme_mdd(
 
     Scoring per canonical position
     --------------------------------
-        canonical  human  predicted  → category
-        ─────────  ─────  ─────────  ──────────
-        ae         ae     ae         → TA
-        d          t      d          → FA    (error accepted, model missed it)
-        v          v      f          → FR    (correct, model wrongly rejected)
-        ay         ey     ey         → TR/CD (error detected, correct diagnosis)
-        s          sh     z          → TR/DE (error detected, wrong diagnosis)
+        canonical  human     predicted  → category
+        ─────────  ────────  ─────────  ──────────
+        ae         ae        ae         → TA
+        d          t         d          → FA        (error accepted)
+        v          v         f          → FR        (correct, wrongly rejected)
+        ay         ey        ey         → TR/CD     (detected, correct diagnosis)
+        s          sh        z          → TR/DE     (detected, wrong diagnosis)
 
-    None in predicted (model deletion) is never equal to any canonical phoneme
-    → treated as FR (if speaker correct) or TR/DE (if speaker wrong).
+    Deletion cases (None = alignment gap, not a silence token):
+        t          None(del) None(del)  → TR/CD     (del_del: both deleted)
+        t          None(del) t          → FA        (del_nodel: model accepted)
+        t          None(del) d          → TR/DE     (del_del1: wrong diagnosis)
+        v          v         None(del)  → FR        (model missed correct phone)
+
+    None is never equal to any real phoneme, so the standard
+    model_accepted / speaker_correct comparisons handle all cases
+    correctly without special-casing, as long as TR/CD is defined as
+    pred == human (both None counts as equal).
     """
     from alignment import levenshtein_alignment
 
@@ -350,15 +386,16 @@ def count_phoneme_mdd(
     # ops is list of (op, ref_item, hyp_item) where ref=canonical, hyp=predicted
     _, _, _, ops = levenshtein_alignment(canonical, predicted)
 
-    # Build predicted-aligned list from ops: one entry per canonical position
-    # Insertions (model produced extra) are skipped — no canonical anchor.
-    # Deletions (model missed a canonical phone) → None at that canonical position.
+    # Build predicted-aligned list from ops: one entry per canonical position.
+    # Insertions (model produced extra phoneme) are skipped — no canonical anchor.
+    # Deletions (model emitted nothing here) → None at that canonical position.
+    # None signals an alignment gap, not a predicted silence token.
     paired_pred = []
     for op, ref_ph, hyp_ph in ops:
         if op == "I":
-            continue          # extra model output, no canonical slot — skip
+            continue                   # model insertion — no canonical slot, discard
         elif op == "D":
-            paired_pred.append(None)   # model missed this canonical phone
+            paired_pred.append(None)   # model deletion — gap in predicted sequence
         else:
             paired_pred.append(hyp_ph) # "C" or "S": model produced something here
 
@@ -369,17 +406,29 @@ def count_phoneme_mdd(
         human_ph = paired_human[i]
         pred_ph  = paired_pred[i]
 
-        model_accepted  = (pred_ph  == canon_ph)
-        speaker_correct = (human_ph == canon_ph)
+        # None is never equal to a real phoneme, so these comparisons correctly
+        # treat any None as "not matching" the canonical phoneme.
+        model_accepted  = (pred_ph  == canon_ph)   # False when pred_ph  is None
+        speaker_correct = (human_ph == canon_ph)   # False when human_ph is None
 
         if speaker_correct and model_accepted:
             counts.TA += 1
         elif not speaker_correct and model_accepted:
+            # FA covers: substitution accepted, or deletion accepted (del_nodel)
             counts.FA += 1
         elif speaker_correct and not model_accepted:
+            # FR covers: correct phone rejected, or model deleted a correct phone
             counts.FR += 1
         else:
-            if pred_ph is not None and human_ph is not None and pred_ph == human_ph:
+            # Both speaker and model deviated from canonical.
+            # TR/CD when pred matches human — this covers:
+            #   • substitution correctly identified (pred == human phoneme)
+            #   • both speaker and model deleted (pred=None == human=None)
+            # TR/DE otherwise — covers:
+            #   • wrong substitution diagnosis (pred != human)
+            #   • speaker deleted but model predicted something wrong (del_del1)
+            #   • model deleted but speaker substituted
+            if pred_ph == human_ph:   # works for (None == None) and (ph == ph)
                 counts.TR_CD += 1
             else:
                 counts.TR_DE += 1
@@ -615,17 +664,31 @@ def count_phonological_mdd(
             human_f = None if human_vec is None else int(human_vec[f_idx])
             pred_f  = None if pred_missing[i, f_idx] else int(pred_aligned[i, f_idx])
 
-            model_accepted  = (pred_f  == canon_f)
-            speaker_correct = (human_f == canon_f)
+            # None is never equal to 0 or 1, so these comparisons correctly
+            # treat any None as "not matching" the canonical feature value.
+            model_accepted  = (pred_f  == canon_f)   # False when pred_f  is None
+            speaker_correct = (human_f == canon_f)   # False when human_f is None
 
             if speaker_correct and model_accepted:
                 cnt.TA += 1
-            elif (not speaker_correct) and model_accepted:
+            elif not speaker_correct and model_accepted:
+                # FA covers: feature substituted and accepted, or
+                # speaker-deleted feature accepted (del_nodel equivalent)
                 cnt.FA += 1
-            elif speaker_correct and (not model_accepted):
+            elif speaker_correct and not model_accepted:
+                # FR covers: correct feature wrongly rejected, or
+                # model failed to emit a token for a correctly-spoken slot
                 cnt.FR += 1
             else:
-                if pred_f is not None and human_f is not None and pred_f == human_f:
+                # Both speaker and model deviated from canonical.
+                # TR/CD when pred matches human — covers:
+                #   • substitution correctly identified (pred == human value)
+                #   • both speaker and model deleted (pred=None == human=None)
+                # TR/DE otherwise — covers:
+                #   • wrong feature value predicted (pred != human value)
+                #   • speaker deleted but model predicted wrong value (del_del1)
+                #   • model deleted but speaker substituted a different value
+                if pred_f == human_f:   # works for (None == None) and (0/1 == 0/1)
                     cnt.TR_CD += 1
                 else:
                     cnt.TR_DE += 1
@@ -1045,14 +1108,14 @@ if __name__ == "__main__":
     print("  Testing count_phoneme_mdd with perfect predicted=canonical ...")
     ph_result = count_phoneme_mdd(_canonical, _human, _canonical[:])
     # predicted == canonical everywhere:
-    #   pos 0: TA (human correct, accepted)
-    #   pos 1: FA (human wrong,   accepted)
-    #   pos 2: TA
-    #   pos 3: FA
-    #   pos 4: FR (human None != canonical "s", but predicted == canonical "s"
-    #              → speaker_correct=False, model_accepted=True → FA)
+    #   pos 0: ae  human=ae  pred=ae   → TA
+    #   pos 1: d   human=t   pred=d    → FA  (substitution accepted)
+    #   pos 2: v   human=v   pred=v    → TA
+    #   pos 3: ey  human=ay  pred=ey   → FA  (substitution accepted)
+    #   pos 4: s   human=None pred=s   → FA  (del_nodel: speaker deleted,
+    #                                          model still predicted canonical)
     assert ph_result.TA >= 2, f"Expected TA>=2, got {ph_result.TA}"
-    assert ph_result.FA >= 2, f"Expected FA>=2, got {ph_result.FA}"
+    assert ph_result.FA >= 3, f"Expected FA>=3, got {ph_result.FA}"
     assert ph_result.FR == 0, f"Expected FR=0, got {ph_result.FR}"
     print(f"    TA={ph_result.TA} FA={ph_result.FA} FR={ph_result.FR} "
           f"TR_CD={ph_result.TR_CD} TR_DE={ph_result.TR_DE}  PASSED")

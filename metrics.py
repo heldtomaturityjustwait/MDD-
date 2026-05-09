@@ -6,27 +6,13 @@ Evaluation metrics strictly following paper Section 5.3.
 5.3.1 Phonological feature recognition:
     FER = (S + D + I) / N          (Eq. 8)
     Precision, Recall, F1           (Eq. 9)
-
-5.3.2 MDD performance:
-    FAR = FA / (FA + TR)           (Eq. 10)
-    FRR = FR / (FR + TA)           (Eq. 10)
-    DER = DE / (CD + DE)           (Eq. 10)
-
-Where:
-    TA = True Acceptance  (correct phoneme → recognized as canonical)
-    TR = True Rejection   (mispronounced  → recognized differently)
-    FA = False Acceptance (mispronounced  → recognized as canonical)
-    FR = False Rejection  (correct phoneme→ recognized differently)
-    CD = Correctly Diagnosed (TR where recognized == actually pronounced)
-    DE = Diagnosis Error     (TR where recognized != actually pronounced)
 """
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 import numpy as np
 
 from phonological_features import PHONOLOGICAL_FEATURES, NUM_FEATURES
-from alignment import levenshtein_alignment, compute_fer
+from alignment import levenshtein_alignment
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -129,125 +115,3 @@ def print_feature_metrics(metrics_list: list[FeatureMetrics]) -> None:
     print("-" * 55)
     print(f"{'AVERAGE':<16} {np.mean(accs):>7.2f} {np.mean(fers):>7.2f} "
           f"{np.mean(pres):>7.2f} {np.mean(recs):>7.2f} {np.mean(f1s):>7.2f}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5.3.2  MDD Metrics
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class MDDCounts:
-    """Running counters for MDD evaluation (paper Section 5.3.2)."""
-    TA: int = 0   # True Acceptance
-    TR: int = 0   # True Rejection
-    FA: int = 0   # False Acceptance
-    FR: int = 0   # False Rejection
-    CD: int = 0   # Correctly Diagnosed (subset of TR)
-    DE: int = 0   # Diagnosis Error     (subset of TR)
-
-    @property
-    def FAR(self) -> float:
-        denom = self.FA + self.TR
-        return self.FA / denom if denom > 0 else 0.0
-
-    @property
-    def FRR(self) -> float:
-        denom = self.FR + self.TA
-        return self.FR / denom if denom > 0 else 0.0
-
-    @property
-    def DER(self) -> float:
-        denom = self.CD + self.DE
-        return self.DE / denom if denom > 0 else 0.0
-
-    def __add__(self, other: "MDDCounts") -> "MDDCounts":
-        return MDDCounts(
-            TA=self.TA + other.TA, TR=self.TR + other.TR,
-            FA=self.FA + other.FA, FR=self.FR + other.FR,
-            CD=self.CD + other.CD, DE=self.DE + other.DE,
-        )
-
-    def summary(self) -> str:
-        return (f"FAR={self.FAR*100:.2f}% | FRR={self.FRR*100:.2f}% | "
-                f"DER={self.DER*100:.2f}%  "
-                f"(TA={self.TA} TR={self.TR} FA={self.FA} FR={self.FR} "
-                f"CD={self.CD} DE={self.DE})")
-
-
-def evaluate_phonological_mdd(
-    mdd_records: list[dict],
-    decoded_features: list[list[bool]],    # [35][U_hyp]
-    ref_feature_seqs: list[list[bool]],    # [35][U_ref]
-) -> MDDCounts:
-    """
-    Compute MDD counts for one utterance at the phonological level.
-
-    Paper Section 5.3.2:
-      "Similar metrics were used for the phonological-level MDD.
-       For instance, if the phoneme /s/ was mispronounced as /z/,
-       this was considered a mispronunciation of the voiced feature only
-       and correct pronunciation for all other phonological features."
-
-    Args:
-        mdd_records: parsed annotation (list of {canonical, status, pronounced})
-        decoded_features: model output [35][U_hyp] bool lists
-        ref_feature_seqs: reference [35][U_ref] bool lists
-    """
-    counts = MDDCounts()
-
-    for feat_idx in range(NUM_FEATURES):
-        ref_seq = ref_feature_seqs[feat_idx]
-        hyp_seq = decoded_features[feat_idx]
-
-        # Align
-        _, _, _, ops = levenshtein_alignment(ref_seq, hyp_seq)
-
-        # We need MDD-level ops: match to annotation records
-        # For simplicity, use the alignment ops directly
-        ref_pos = 0
-        for op, ref_val, hyp_val in ops:
-            if ref_pos >= len(mdd_records):
-                break
-
-            record = mdd_records[ref_pos]
-            is_mispronounced = record["status"] != "C"
-
-            if op == "C":
-                if is_mispronounced:
-                    counts.FA += 1   # error accepted as correct
-                else:
-                    counts.TA += 1   # correct accepted
-                ref_pos += 1
-            elif op == "S":
-                if is_mispronounced:
-                    # True Rejection: did the model diagnose correctly?
-                    counts.TR += 1
-                    # For phonological MDD: CD if the feature changed correctly
-                    if ref_val != hyp_val:   # feature changed → detected
-                        counts.CD += 1
-                    else:
-                        counts.DE += 1
-                else:
-                    counts.FR += 1   # correct pronunciation rejected
-                ref_pos += 1
-            elif op == "D":
-                if is_mispronounced:
-                    counts.TR += 1; counts.DE += 1
-                else:
-                    counts.FR += 1
-                ref_pos += 1
-            # Insertion: extra hypothesis symbol, no canonical reference consumed
-
-    return counts
-
-
-def print_mdd_summary(counts: MDDCounts, label: str = "MDD") -> None:
-    print(f"\n{'='*50}")
-    print(f"  {label}")
-    print(f"{'='*50}")
-    print(f"  FAR : {counts.FAR*100:.2f}%")
-    print(f"  FRR : {counts.FRR*100:.2f}%")
-    print(f"  DER : {counts.DER*100:.2f}%")
-    print(f"  TA={counts.TA}  TR={counts.TR}  FA={counts.FA}  FR={counts.FR}")
-    print(f"  CD={counts.CD}  DE={counts.DE}")
-    print(f"{'='*50}\n")
