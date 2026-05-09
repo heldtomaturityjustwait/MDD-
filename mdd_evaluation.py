@@ -21,6 +21,19 @@ MDD categories (per canonical position):
   TR/CD : predicted != canonical  AND  human != canonical  AND  predicted == human
   TR/DE : predicted != canonical  AND  human != canonical  AND  predicted != human
 
+  NOTE — phoneme vs phonological level differ for substitution cases:
+
+  Phoneme level (count_phoneme_mdd):
+    hit    + s → always TR+CD  (no cma check; Shahin's phoneme evaluator)
+    replace+ s → always FA
+    delete + s → always TR+DE
+
+  Phonological level (count_phonological_mdd):
+    hit    + s → TA    if canon feature == actual feature (cma),  else TR+CD
+    replace+ s → FR    if canon feature == actual feature (cma),  else FA
+    delete + s → FR    if canon feature == actual feature (cma),  else TR+DE
+    (cma = the substitution did not change this particular feature)
+
   None values (deletion gaps from Levenshtein alignment) are treated as
   distinct from every phoneme/feature value, so:
 
@@ -374,13 +387,13 @@ def count_phoneme_mdd(
 
     Classification (asr_evl × error):
       hit    + c → TA
-      hit    + s → TA if canon==actual, else TR+CD
+      hit    + s → TR+CD  (model agrees with human error — correct diagnosis)
       hit    + a → TR+CD
       replace+ c → FR
-      replace+ s → FR if canon==actual, else FA
+      replace+ s → FA     (model predicts canonical despite human error)
       replace+ a → TR+DE
       delete + c → FR
-      delete + s → FR if canon==actual, else TR+DE
+      delete + s → TR+DE  (model missed the phone, human error present)
       delete + a → FA
     """
     from alignment import levenshtein_alignment
@@ -423,25 +436,21 @@ def count_phoneme_mdd(
     for ref_pos, asr_pos, ori_pos in zip(range(H), hyp_pos_arr, ori_indx):
         evl   = asr_evl[ref_pos]
         error = pron_errors[ori_pos]
-        cma   = (exp_trans[ori_pos] == act_trans[ori_pos])  # canon_matches_actual
 
         if evl == "hit":
-            if error == "c":                         counts.TA    += 1
-            elif error == "s" and cma:               counts.TA    += 1
-            elif error == "s" and not cma:           counts.TR_CD += 1
-            elif error == "a":                       counts.TR_CD += 1
+            if error == "c":             counts.TA    += 1
+            elif error == "s":           counts.TR_CD += 1  # always TR+CD at phoneme level
+            elif error == "a":           counts.TR_CD += 1
 
         elif evl == "replace":
-            if error == "c":                         counts.FR    += 1
-            elif error == "s" and cma:               counts.FR    += 1
-            elif error == "s" and not cma:           counts.FA    += 1
-            elif error == "a":                       counts.TR_DE += 1
+            if error == "c":             counts.FR    += 1
+            elif error == "s":           counts.FA    += 1  # model predicts canon, human wrong → FA
+            elif error == "a":           counts.TR_DE += 1
 
         elif evl == "delete":
-            if error == "c":                         counts.FR    += 1
-            elif error == "s" and cma:               counts.FR    += 1
-            elif error == "s" and not cma:           counts.TR_DE += 1
-            elif error == "a":                       counts.FA    += 1
+            if error == "c":             counts.FR    += 1
+            elif error == "s":           counts.TR_DE += 1  # always TR+DE at phoneme level
+            elif error == "a":           counts.FA    += 1
 
     # Step 3: model insertion loop
     for ins_ref_pos, ins_hyp_pos in asr_ins_errors:

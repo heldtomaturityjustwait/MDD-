@@ -106,6 +106,16 @@ def train_epoch(
                 f"Loss={avg:.4f} | LR={lr:.2e}"
             )
 
+    # Flush any remaining accumulated gradients that didn't fill a full
+    # accumulation window (happens when len(loader) % grad_accum_steps != 0).
+    # Without this, those gradients are silently discarded at the next
+    # optimizer.zero_grad() call at the top of the following epoch.
+    if len(loader) % grad_accum_steps != 0:
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
     return total_loss / max(n_batches, 1)
 
 
