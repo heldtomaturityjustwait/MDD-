@@ -379,12 +379,29 @@ def run_confusion_analysis(
     return pair_stats
 
 
+def _bold(s):
+    """Wrap string in ANSI bold for terminal output."""
+    return f"\033[1m{s}\033[0m"
+
+
 def print_table(pair_list, pair_stats, title):
-    print(f"\n{'='*70}")
+    """
+    Print a table matching Tables 5 & 6 in Shahin et al. (2025).
+
+    Columns: Conf_ph | Phonetic FAR | Phonetic FRR | Feature | Phonological FAR | Phonological FRR
+
+    The lower value in each FAR/FRR pair (phonetic vs phonological) is bolded,
+    matching the paper's bold convention.
+    """
+    SEP = "─" * 68
+    HDR = "=" * 68
+
+    print(f"\n{HDR}")
     print(f"  {title}")
-    print(f"{'='*70}")
-    print(f"  {'Pair':<8} {'Ph-FAR':>7} {'Ph-FRR':>7}  {'Feature':<14} {'Feat-FAR':>8} {'Feat-FRR':>8}")
-    print(f"  {'-'*8} {'-'*7} {'-'*7}  {'-'*14} {'-'*8} {'-'*8}")
+    print(f"{HDR}")
+    print(f"  {'Conf_ph':<10}  {'Phonetic':^17}    {'':^12}  {'Phonological':^17}")
+    print(f"  {'':10}  {'FAR':>7}  {'FRR':>7}    {'Feature':<12}  {'FAR':>7}  {'FRR':>7}")
+    print(f"  {SEP}")
 
     far_improvements = []
     for a, b in pair_list:
@@ -392,24 +409,51 @@ def print_table(pair_list, pair_stats, title):
         stats = pair_stats.get(key)
         if stats is None:
             continue
+
         ph_far = stats.phoneme_FAR()
         ph_frr = stats.phoneme_FRR()
-        best = stats.best_feature()
-        if best is None:
-            print(f"  {a}/{b:<6} {ph_far:>7.2f} {ph_frr:>7.2f}  {'no distinctive feat':<14}")
-            continue
-        feat_name, feat_far, feat_frr = best
-        improvement = ph_far - feat_far
-        if not np.isnan(improvement):
-            far_improvements.append(improvement)
-        marker = " ✓" if feat_far < ph_far else "  "
-        print(f"  {a}/{b:<6} {ph_far:>7.2f} {ph_frr:>7.2f}  "
-              f"{feat_name:<14} {feat_far:>8.2f} {feat_frr:>8.2f}{marker}")
+        best   = stats.best_feature()
+        conf_ph = f"{a}/{b}"
 
+        if best is None:
+            far_s = f"{ph_far:7.2f}" if not np.isnan(ph_far) else "    n/a"
+            frr_s = f"{ph_frr:7.2f}" if not np.isnan(ph_frr) else "    n/a"
+            print(f"  {conf_ph:<10}  {far_s}  {frr_s}    {'—':<12}  {'':>7}  {'':>7}")
+            continue
+
+        feat_name, feat_far, feat_frr = best
+
+        # Bold the lower FAR
+        if not (np.isnan(ph_far) or np.isnan(feat_far)):
+            if feat_far <= ph_far:
+                ph_far_s, feat_far_s = f"{ph_far:7.2f}", _bold(f"{feat_far:7.2f}")
+            else:
+                ph_far_s, feat_far_s = _bold(f"{ph_far:7.2f}"), f"{feat_far:7.2f}"
+        else:
+            ph_far_s   = f"{ph_far:7.2f}"   if not np.isnan(ph_far)   else "    n/a"
+            feat_far_s = f"{feat_far:7.2f}" if not np.isnan(feat_far) else "    n/a"
+
+        # Bold the lower FRR
+        if not (np.isnan(ph_frr) or np.isnan(feat_frr)):
+            if feat_frr <= ph_frr:
+                ph_frr_s, feat_frr_s = f"{ph_frr:7.2f}", _bold(f"{feat_frr:7.2f}")
+            else:
+                ph_frr_s, feat_frr_s = _bold(f"{ph_frr:7.2f}"), f"{feat_frr:7.2f}"
+        else:
+            ph_frr_s   = f"{ph_frr:7.2f}"   if not np.isnan(ph_frr)   else "    n/a"
+            feat_frr_s = f"{feat_frr:7.2f}" if not np.isnan(feat_frr) else "    n/a"
+
+        if not (np.isnan(ph_far) or np.isnan(feat_far)):
+            far_improvements.append(ph_far - feat_far)
+
+        print(f"  {conf_ph:<10}  {ph_far_s}  {ph_frr_s}    {feat_name:<12}  {feat_far_s}  {feat_frr_s}")
+
+    print(f"  {SEP}")
     if far_improvements:
-        print(f"\n  Avg FAR improvement: {np.mean(far_improvements):.1f}% ± {np.std(far_improvements):.1f}%")
         n_better = sum(1 for x in far_improvements if x > 0)
-        print(f"  Feature better than phoneme in {n_better}/{len(pair_list)} pairs")
+        print(f"\n  Phonological FAR lower in {n_better}/{len(pair_list)} pairs  "
+              f"(avg improvement: {np.mean(far_improvements):+.1f}%)")
+    print()
 
 
 def main():
