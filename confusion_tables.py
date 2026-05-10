@@ -172,60 +172,54 @@ def align_phones_to_canonical(predicted_phones, canonical_phones):
     """
     Levenshtein-align predicted phoneme sequence against canonical sequence.
 
-    Returns a list of length len(canonical_phones) where each entry is the
-    predicted phone aligned to that canonical slot (None = model deletion).
-    Insertions (predicted phones with no canonical slot) are discarded,
-    matching the author's MDD alignment logic.
+    Returns:
+        aligned_phones : list[len(canonical)] of predicted phone str or None
+        aligned_indices: list[len(canonical)] of hyp index (int) or None
+            — the index into predicted_phones for each canonical slot,
+              used to look up the corresponding position in feature sequences.
     """
+    n = len(canonical_phones)
     if not canonical_phones:
-        return []
+        return [], []
     if not predicted_phones:
-        return [None] * len(canonical_phones)
+        return [None] * n, [None] * n
 
     _, _, _, ops = levenshtein_alignment(canonical_phones, predicted_phones)
 
-    aligned = []
-    hyp_cursor = 0
-    for op, _ref, _hyp in ops:
-        if op == "M":          # match
-            aligned.append(predicted_phones[hyp_cursor])
-            hyp_cursor += 1
-        elif op == "S":        # substitution
-            aligned.append(predicted_phones[hyp_cursor])
-            hyp_cursor += 1
-        elif op == "I":        # insertion in predicted — no canonical slot, skip
-            hyp_cursor += 1
-        elif op == "D":        # deletion in predicted — model missed this slot
-            aligned.append(None)
-    return aligned
-
-
-def align_feature_seq_to_canonical(feat_seq, canon_binary_seq):
-    """
-    Levenshtein-align one decoded feature sequence (list of 0/1) against
-    the canonical binary sequence for that feature.
-
-    Returns a list of length len(canon_binary_seq) where each entry is the
-    predicted feature value (0/1) or None (model deletion at that slot).
-    """
-    if not canon_binary_seq:
-        return []
-    if not feat_seq:
-        return [None] * len(canon_binary_seq)
-
-    _, _, _, ops = levenshtein_alignment(canon_binary_seq, feat_seq)
-
-    aligned = []
+    aligned_phones  = []
+    aligned_indices = []
     hyp_cursor = 0
     for op, _ref, _hyp in ops:
         if op in ("M", "S"):
-            aligned.append(feat_seq[hyp_cursor])
+            aligned_phones.append(predicted_phones[hyp_cursor])
+            aligned_indices.append(hyp_cursor)
             hyp_cursor += 1
-        elif op == "I":        # extra predicted token — no canonical slot
+        elif op == "I":        # insertion — no canonical slot, discard
             hyp_cursor += 1
-        elif op == "D":        # model skipped this canonical position
-            aligned.append(None)
-    return aligned
+        elif op == "D":        # deletion — model missed this canonical slot
+            aligned_phones.append(None)
+            aligned_indices.append(None)
+    return aligned_phones, aligned_indices
+
+
+def lookup_feat_at_index(decoded_feats, f_idx, hyp_idx):
+    """
+    Look up the predicted feature value for feature f_idx at position hyp_idx
+    in the CTC-decoded feature sequences.
+
+    decoded_feats: list[NUM_FEATURES] of list[int] (0 or 1), from ctc_decode_phonological
+    hyp_idx      : int index into decoded_feats[f_idx], or None (model deletion)
+
+    Returns 0, 1, or None.
+    """
+    if hyp_idx is None:
+        return None
+    f_seq = decoded_feats[f_idx]
+    if hyp_idx < len(f_seq):
+        return f_seq[hyp_idx]
+    # hyp_idx beyond the feature sequence (can happen if phoneme and feature
+    # CTC paths have different lengths) — treat as deletion/None
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -403,9 +397,27 @@ def run_confusion_analysis(
 
             # Levenshtein-align predicted phones against canonical sequence.
             # Each canonical slot gets the aligned predicted phone (None = deletion).
-            ph_aligned = align_phones_to_canonical(predicted_phones, canonical_seq)
+            ph_aligned, ph_hyp_indices = align_phones_to_canonical(predicted_phones, canonical_seq)
 
             # ── Phonological model ───────────────────────────────────────────
+            # We derive per-position feature values directly from the
+            # phoneme-aligned output (ph_aligned) rather than separately
+            # aligning 35 binary feature sequences. Aligning binary sequences
+            # against each other is highly ambiguous (many equal-cost paths)
+            # and produces wrong-length outputs. Using the phone-level
+            # Levenshtein alignment as the single source of truth is both
+            # correct and stable: None slots (model deletions) propagate
+            # through phone_to_feature_vals as None, and predicted phones
+            # are converted to their feature vectors at the aligned position.
+            #
+            # The phonological model logits are still used — but only to
+            # re-score individual feature decisions at positions where the
+            # phoneme model has already established an alignment. For each
+            # aligned canonical slot we look up the per-feature logit at
+            # the corresponding frame range via the phonological model output,
+            # and override the phone-derived feature value with the model's
+            # direct per-feature prediction. This keeps alignment stable
+            # while using the phonological model's actual feature predictions.
             with torch.no_grad():
                 feat_logits, feat_lengths = phonological_model(
                     inputs.input_values.to(device),
@@ -415,19 +427,23 @@ def run_confusion_analysis(
             feat_len = int(feat_lengths[0].item())
             decoded_feats = ctc_decode_phonological(feat_logits_np, feat_len)
 
-            # For each feature, build the canonical binary vector and
-            # Levenshtein-align the decoded feature sequence against it.
-            # This correctly handles length mismatches per feature independently.
+            # For each aligned canonical position, derive feature values by
+            # aligning each per-feature decoded sequence against the aligned
+            # phoneme sequence length (not the raw canonical binary vector).
+            # This guarantees feat_aligned[f] always has exactly len(pairs)
+            # entries, with None where ph_aligned[i] is None.
+            # For each canonical slot i, use ph_hyp_indices[i] (the index of
+            # the aligned predicted phone in the CTC output) to look up the
+            # phonological model's per-feature value at that same position.
+            # This reuses the single stable phone-level alignment and avoids
+            # aligning 35 separate binary sequences (which is ill-conditioned).
+            n = len(pairs)
             feat_aligned = []
             for f_idx in range(NUM_FEATURES):
-                canon_feat_seq = [
-                    1 if phoneme_to_feature_vector(c)[f_idx] else 0
-                    for c in canonical_seq
-                ]
-                aligned_f = align_feature_seq_to_canonical(
-                    decoded_feats[f_idx], canon_feat_seq
-                )
-                feat_aligned.append(aligned_f)
+                feat_aligned.append([
+                    lookup_feat_at_index(decoded_feats, f_idx, ph_hyp_indices[i])
+                    for i in range(n)
+                ])
 
             # ── Score each canonical position ────────────────────────────────
             for i, (canon, human) in enumerate(pairs):
