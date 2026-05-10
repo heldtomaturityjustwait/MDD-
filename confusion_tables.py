@@ -37,6 +37,7 @@ from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from alignment import levenshtein_alignment
 from phonological_features import (
     PHONOLOGICAL_FEATURES, NUM_FEATURES, NUM_OUTPUT_NODES,
     BLANK_IDX, PHONEME_FEATURES,
@@ -167,10 +168,64 @@ def ctc_decode_phonological(logits_np, valid_len=None):
     return decoded
 
 
-def positional_align(decoded_seq, n_canonical):
-    """Zip-align decoded sequence to canonical length."""
-    return [decoded_seq[i] if i < len(decoded_seq) else None
-            for i in range(n_canonical)]
+def align_phones_to_canonical(predicted_phones, canonical_phones):
+    """
+    Levenshtein-align predicted phoneme sequence against canonical sequence.
+
+    Returns a list of length len(canonical_phones) where each entry is the
+    predicted phone aligned to that canonical slot (None = model deletion).
+    Insertions (predicted phones with no canonical slot) are discarded,
+    matching the author's MDD alignment logic.
+    """
+    if not canonical_phones:
+        return []
+    if not predicted_phones:
+        return [None] * len(canonical_phones)
+
+    _, _, _, ops = levenshtein_alignment(canonical_phones, predicted_phones)
+
+    aligned = []
+    hyp_cursor = 0
+    for op, _ref, _hyp in ops:
+        if op == "M":          # match
+            aligned.append(predicted_phones[hyp_cursor])
+            hyp_cursor += 1
+        elif op == "S":        # substitution
+            aligned.append(predicted_phones[hyp_cursor])
+            hyp_cursor += 1
+        elif op == "I":        # insertion in predicted — no canonical slot, skip
+            hyp_cursor += 1
+        elif op == "D":        # deletion in predicted — model missed this slot
+            aligned.append(None)
+    return aligned
+
+
+def align_feature_seq_to_canonical(feat_seq, canon_binary_seq):
+    """
+    Levenshtein-align one decoded feature sequence (list of 0/1) against
+    the canonical binary sequence for that feature.
+
+    Returns a list of length len(canon_binary_seq) where each entry is the
+    predicted feature value (0/1) or None (model deletion at that slot).
+    """
+    if not canon_binary_seq:
+        return []
+    if not feat_seq:
+        return [None] * len(canon_binary_seq)
+
+    _, _, _, ops = levenshtein_alignment(canon_binary_seq, feat_seq)
+
+    aligned = []
+    hyp_cursor = 0
+    for op, _ref, _hyp in ops:
+        if op in ("M", "S"):
+            aligned.append(feat_seq[hyp_cursor])
+            hyp_cursor += 1
+        elif op == "I":        # extra predicted token — no canonical slot
+            hyp_cursor += 1
+        elif op == "D":        # model skipped this canonical position
+            aligned.append(None)
+    return aligned
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -301,8 +356,7 @@ def run_confusion_analysis(
     all_pairs = CONSONANT_PAIRS + VOWEL_PAIRS
     pair_stats = {}
     for a, b in all_pairs:
-        key = (a, b)
-        pair_stats[key] = PairStats(a, b)
+        pair_stats[(a, b)] = PairStats(a, b)
 
     root = Path(l2arctic_dir)
 
@@ -314,7 +368,7 @@ def run_confusion_analysis(
             continue
 
         for ann_file in sorted(ann_dir.glob("*.TextGrid")):
-            utt_id = ann_file.stem
+            utt_id   = ann_file.stem
             wav_file = wav_dir / f"{utt_id}.wav"
             if not wav_file.exists():
                 continue
@@ -323,17 +377,21 @@ def run_confusion_analysis(
             if not pairs:
                 continue
 
+            # canonical sequence — what should have been said at each position
+            canonical_seq = [canon for canon, _ in pairs]
+
             # Load audio
             waveform, sr = torchaudio.load(str(wav_file))
             if sr != 16000:
                 waveform = torchaudio.functional.resample(waveform, sr, 16000)
             waveform = waveform.mean(dim=0)
 
-            # Run phoneme model
             inputs = feature_extractor(
                 waveform.numpy(), sampling_rate=16000,
                 return_tensors="pt", padding=True,
             )
+
+            # ── Phoneme model ────────────────────────────────────────────────
             with torch.no_grad():
                 ph_logits, ph_lengths = phoneme_model(
                     inputs.input_values.to(device),
@@ -343,7 +401,11 @@ def run_confusion_analysis(
             ph_len = int(ph_lengths[0].item())
             predicted_phones = ctc_decode_phoneme(ph_logits_np[:ph_len])
 
-            # Run phonological model
+            # Levenshtein-align predicted phones against canonical sequence.
+            # Each canonical slot gets the aligned predicted phone (None = deletion).
+            ph_aligned = align_phones_to_canonical(predicted_phones, canonical_seq)
+
+            # ── Phonological model ───────────────────────────────────────────
             with torch.no_grad():
                 feat_logits, feat_lengths = phonological_model(
                     inputs.input_values.to(device),
@@ -353,21 +415,28 @@ def run_confusion_analysis(
             feat_len = int(feat_lengths[0].item())
             decoded_feats = ctc_decode_phonological(feat_logits_np, feat_len)
 
-            # Align predictions to canonical positions
-            n = len(pairs)
-            ph_aligned = positional_align(predicted_phones, n)
-            feat_aligned = [positional_align(decoded_feats[f], n)
-                            for f in range(NUM_FEATURES)]
+            # For each feature, build the canonical binary vector and
+            # Levenshtein-align the decoded feature sequence against it.
+            # This correctly handles length mismatches per feature independently.
+            feat_aligned = []
+            for f_idx in range(NUM_FEATURES):
+                canon_feat_seq = [
+                    1 if phoneme_to_feature_vector(c)[f_idx] else 0
+                    for c in canonical_seq
+                ]
+                aligned_f = align_feature_seq_to_canonical(
+                    decoded_feats[f_idx], canon_feat_seq
+                )
+                feat_aligned.append(aligned_f)
 
-            # Score each position
+            # ── Score each canonical position ────────────────────────────────
             for i, (canon, human) in enumerate(pairs):
-                pred_phone = ph_aligned[i]
+                pred_phone    = ph_aligned[i]
                 pred_feat_vals = [feat_aligned[f][i] for f in range(NUM_FEATURES)]
 
-                # Check if this position is relevant to any pair
                 for (a, b), stats in pair_stats.items():
-                    is_sub_ab = (canon == a and human == b)
-                    is_sub_ba = (canon == b and human == a)
+                    is_sub_ab    = (canon == a and human == b)
+                    is_sub_ba    = (canon == b and human == a)
                     is_correct_a = (canon == a and human == a)
                     is_correct_b = (canon == b and human == b)
 
