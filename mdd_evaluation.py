@@ -947,6 +947,347 @@ def _run_phonological_wav2vec2(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Suitcase TextGrid parser — timestamp-aware, returns MDD structures per chunk
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_suitcase_textgrid_for_mdd(textgrid_path: str) -> list[dict]:
+    """
+    Parse a suitcase annotation TextGrid and return one record per interval
+    with timestamps and full MDD annotation fields.
+
+    Each record:
+        xmin, xmax   : float  — interval boundaries in seconds
+        is_silence   : bool
+        error        : str    — 'c', 's', 'd', 'a'   (None for silence)
+        exp_phone    : str    — canonical phoneme      (None for silence)
+        act_phone    : str    — actual phoneme (None if deleted or silence)
+
+    These records are later chunked and converted to the five sequences
+    expected by count_phoneme_mdd / count_phonological_mdd.
+    """
+    import re as _re
+    path = Path(textgrid_path)
+    if not path.exists():
+        return []
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+
+    tier_blocks = _re.split(r'item\s*\[\d+\]', content)
+    phones_block = None
+    for block in tier_blocks:
+        if _re.search(r'name\s*=\s*"phones?"', block, re.IGNORECASE):
+            phones_block = block
+            break
+    if phones_block is None:
+        return []
+
+    intervals = _re.findall(
+        r'intervals\s*\[\d+\].*?xmin\s*=\s*([\d.]+).*?xmax\s*=\s*([\d.]+)'
+        r'.*?text\s*=\s*"([^"]*)"',
+        phones_block, re.DOTALL,
+    )
+
+    records = []
+    for xmin_s, xmax_s, text in intervals:
+        xmin, xmax = float(xmin_s), float(xmax_s)
+        text = text.strip()
+
+        if text in ("", "sil", "sp", "spn", "<unk>"):
+            records.append({"xmin": xmin, "xmax": xmax, "is_silence": True,
+                            "error": None, "exp_phone": None, "act_phone": None})
+            continue
+
+        parts = [p.strip() for p in text.split(",")]
+
+        if len(parts) == 1:
+            ph = normalize_phoneme(parts[0])
+            if ph == "sil":
+                records.append({"xmin": xmin, "xmax": xmax, "is_silence": True,
+                                "error": None, "exp_phone": None, "act_phone": None})
+            else:
+                records.append({"xmin": xmin, "xmax": xmax, "is_silence": False,
+                                "error": "c", "exp_phone": ph, "act_phone": ph})
+
+        elif len(parts) == 3:
+            canonical_raw, pronounced_raw, error_type = parts
+            error_type = error_type.strip().lower()
+
+            if error_type == "s":
+                canon_ph = normalize_phoneme(canonical_raw)
+                if canon_ph == "sil":
+                    records.append({"xmin": xmin, "xmax": xmax, "is_silence": True,
+                                    "error": None, "exp_phone": None, "act_phone": None})
+                    continue
+                pronounced_clean = pronounced_raw.replace("*", "").strip()
+                act_ph = ("sil" if pronounced_clean.lower() == "err"
+                          else normalize_phoneme(pronounced_clean))
+                records.append({"xmin": xmin, "xmax": xmax, "is_silence": False,
+                                "error": "s", "exp_phone": canon_ph,
+                                "act_phone": act_ph if act_ph != "sil" else None})
+
+            elif error_type == "d":
+                canon_ph = normalize_phoneme(canonical_raw)
+                if canon_ph == "sil":
+                    records.append({"xmin": xmin, "xmax": xmax, "is_silence": True,
+                                    "error": None, "exp_phone": None, "act_phone": None})
+                    continue
+                # Deletion: no audio produced, but keep for MDD step 3/4
+                records.append({"xmin": xmin, "xmax": xmax, "is_silence": False,
+                                "error": "d", "exp_phone": canon_ph, "act_phone": None})
+
+            elif error_type == "a":
+                pronounced_clean = pronounced_raw.replace("*", "").strip()
+                act_ph = normalize_phoneme(pronounced_clean)
+                if act_ph == "sil":
+                    records.append({"xmin": xmin, "xmax": xmax, "is_silence": True,
+                                    "error": None, "exp_phone": None, "act_phone": None})
+                    continue
+                records.append({"xmin": xmin, "xmax": xmax, "is_silence": False,
+                                "error": "a", "exp_phone": "sil", "act_phone": act_ph})
+
+    return records
+
+
+def _chunk_suitcase_records(
+    records: list[dict],
+    max_chunk_duration: float = 10.0,
+) -> list[list[dict]]:
+    """
+    Split suitcase interval records into chunks ≤ max_chunk_duration seconds,
+    preferring silence boundaries (mirrors dataset.py _chunk_records).
+    """
+    if not records:
+        return []
+    chunks, current, chunk_start = [], [], records[0]["xmin"]
+    for rec in records:
+        duration = rec["xmax"] - chunk_start
+        if rec["is_silence"] and duration >= max_chunk_duration * 0.5:
+            if current:
+                chunks.append(current)
+            current, chunk_start = [], rec["xmax"]
+            continue
+        if duration >= max_chunk_duration:
+            if current:
+                chunks.append(current)
+            current, chunk_start = [rec], rec["xmin"]
+        else:
+            current.append(rec)
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _suitcase_chunk_to_mdd_sequences(
+    chunk: list[dict],
+) -> tuple[list[str], list[str], list[str], list[str], list[str], list[int]]:
+    """
+    Convert a list of suitcase interval records (one chunk) into the five
+    sequences expected by count_phoneme_mdd / count_phonological_mdd.
+
+    Mirrors parse_annotation_for_mdd() exactly — deletions stay in
+    pron_errors but are absent from human; additions are in human.
+    """
+    pron_errors: list[str] = []
+    exp_trans:   list[str] = []
+    act_trans:   list[str] = []
+    human:       list[str] = []
+    ori_indx:    list[int] = []
+    ann_idx = 0
+
+    for rec in chunk:
+        if rec["is_silence"] or rec["error"] is None:
+            continue
+
+        error     = rec["error"]
+        exp_phone = rec["exp_phone"] or "sil"
+        act_phone = rec["act_phone"] or "sil"
+
+        if error == "c":
+            pron_errors.append("c")
+            exp_trans.append(exp_phone)
+            act_trans.append(act_phone)
+            human.append(act_phone)
+            ori_indx.append(ann_idx)
+            ann_idx += 1
+
+        elif error == "s":
+            pron_errors.append("s")
+            exp_trans.append(exp_phone)
+            act_trans.append(act_phone)
+            if act_phone != "sil":
+                human.append(act_phone)
+                ori_indx.append(ann_idx)
+            ann_idx += 1
+
+        elif error == "d":
+            # Deletion — not in human, kept for two-pass cleanup
+            pron_errors.append("d")
+            exp_trans.append(exp_phone)
+            act_trans.append("sil")
+            ann_idx += 1
+
+        elif error == "a":
+            pron_errors.append("a")
+            exp_trans.append("sil")
+            act_trans.append(act_phone)
+            human.append(act_phone)
+            ori_indx.append(ann_idx)
+            ann_idx += 1
+
+    canonical = [exp_trans[ori_indx[i]] for i in range(len(human))]
+    return human, canonical, pron_errors, exp_trans, act_trans, ori_indx
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Suitcase corpus evaluation loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_mdd_suitcase(
+    l2arctic_root:        str,
+    speakers:             list[str],
+    phoneme_model         = None,
+    phonological_model    = None,
+    feature_extractor     = None,
+    device:      str        = "cuda",
+    output_json: Optional[str] = None,
+    max_chunk_duration: float = 10.0,
+    verbose:     bool       = True,
+) -> dict:
+    """
+    Run MDD evaluation on the L2-ARCTIC suitcase (spontaneous speech) corpus.
+
+    Each speaker has ONE long WAV + ONE fully-annotated TextGrid under:
+        <l2arctic_root>/suitcase_corpus/wav/<spk_lower>.wav
+        <l2arctic_root>/suitcase_corpus/annotation/<spk_lower>.TextGrid
+
+    The long recording is split into chunks of ≤ max_chunk_duration seconds
+    using silence boundaries from the TextGrid timestamps.  Each chunk is
+    treated as one utterance for evaluation purposes.
+
+    Args:
+        l2arctic_root      : root path of the L2-ARCTIC corpus
+        speakers           : list of speaker IDs (e.g. ["RRBI", "YBAA", ...])
+        phoneme_model      : PhonemeLevelWav2Vec2 instance (optional)
+        phonological_model : PhonologicalWav2Vec2 instance (optional)
+        feature_extractor  : Wav2Vec2FeatureExtractor (shared by both models)
+        device             : "cuda" or "cpu"
+        output_json        : if set, save results to this path as JSON
+        max_chunk_duration : max chunk length in seconds (default 10.0)
+        verbose            : log progress
+
+    Returns:
+        dict with keys: phoneme_level, phonological_level, counts
+    """
+    import torch
+    import torchaudio
+
+    evaluator = MDDEvaluator()
+    suit_root = Path(l2arctic_root) / "suitcase_corpus"
+    wav_dir   = suit_root / "wav"
+    ann_dir   = suit_root / "annotation"
+
+    if phoneme_model is not None:
+        phoneme_model.to(device).eval()
+    if phonological_model is not None:
+        phonological_model.to(device).eval()
+
+    n_total = n_skipped = 0
+
+    for spk in speakers:
+        # Suitcase files are named with lowercase speaker ID
+        wav_file = wav_dir / f"{spk.lower()}.wav"
+        tg_file  = ann_dir / f"{spk.lower()}.TextGrid"
+
+        if not wav_file.exists():
+            logger.warning(f"[suitcase] wav not found for {spk}: {wav_file}")
+            continue
+        if not tg_file.exists():
+            logger.warning(f"[suitcase] TextGrid not found for {spk}: {tg_file}")
+            continue
+
+        # Parse the full TextGrid into MDD-annotated interval records
+        records = _parse_suitcase_textgrid_for_mdd(str(tg_file))
+        if not records:
+            logger.warning(f"[suitcase] no records parsed for {spk}, skipping")
+            continue
+
+        # Load native sample rate (don't load the full audio yet)
+        _, native_sr = torchaudio.load(str(wav_file), num_frames=1)
+
+        chunks = _chunk_suitcase_records(records, max_chunk_duration)
+        if verbose:
+            print(f"  [{spk}] suitcase: {len(chunks)} chunks from {tg_file.name}")
+
+        for chunk_idx, chunk in enumerate(chunks):
+            n_total += 1
+            utt_id = f"{spk.lower()}_{chunk_idx:03d}"
+
+            if verbose and chunk_idx % 50 == 0 and chunk_idx > 0:
+                print(f"    [{spk}] chunk {chunk_idx}/{len(chunks)}")
+
+            # Build MDD sequences from this chunk
+            (human, canonical, pron_errors,
+             exp_trans, act_trans, ori_indx) = _suitcase_chunk_to_mdd_sequences(chunk)
+
+            if not human:
+                n_skipped += 1
+                continue
+
+            # Slice audio for this chunk (timestamp → sample index)
+            start_sample = int(chunk[0]["xmin"] * native_sr)
+            end_sample   = int(chunk[-1]["xmax"] * native_sr)
+            num_frames   = end_sample - start_sample
+            if num_frames <= 0:
+                n_skipped += 1
+                continue
+
+            waveform, sr = torchaudio.load(
+                str(wav_file),
+                frame_offset=start_sample,
+                num_frames=num_frames,
+            )
+            if sr != 16000:
+                waveform = torchaudio.functional.resample(waveform, sr, 16000)
+            waveform = waveform.mean(dim=0)   # mono (T,)
+
+            # Phoneme-level MDD
+            if phoneme_model is not None and feature_extractor is not None:
+                try:
+                    predicted_phones = _run_phoneme_wav2vec2(
+                        phoneme_model, feature_extractor, waveform, device
+                    )
+                    evaluator.add_phoneme_utterance(
+                        human, canonical, pron_errors, exp_trans,
+                        act_trans, ori_indx, predicted_phones, utt_id
+                    )
+                except Exception as e:
+                    logger.warning(f"[{utt_id}] phoneme model inference error: {e}")
+
+            # Phonological-level MDD
+            if phonological_model is not None and feature_extractor is not None:
+                try:
+                    logits = _run_phonological_wav2vec2(
+                        phonological_model, feature_extractor, waveform, device
+                    )
+                    evaluator.add_phonological_utterance(
+                        human, canonical, pron_errors, exp_trans,
+                        act_trans, ori_indx, logits, utt_id
+                    )
+                except Exception as e:
+                    logger.warning(f"[{utt_id}] phonological model inference error: {e}")
+
+    print(f"\n[evaluate_mdd_suitcase] total={n_total}  skipped={n_skipped}  "
+          f"evaluated={n_total - n_skipped}")
+    evaluator.print_report()
+
+    if output_json:
+        evaluator.save_json(output_json)
+
+    return evaluator.compute()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Full corpus evaluation loop
 
 def evaluate_mdd(
@@ -1104,6 +1445,19 @@ if __name__ == "__main__":
     parser.add_argument("--output_json",          type=str, default=None)
     parser.add_argument("--device",               type=str, default="cuda")
     parser.add_argument("--sanity_check",         action="store_true")
+    parser.add_argument("--suitcase",             action="store_true",
+                        help="Also run MDD evaluation on the suitcase corpus "
+                             "(l2arctic_dir/suitcase_corpus/). Results are saved "
+                             "separately to <output_json>.suitcase.json if "
+                             "--output_json is given.")
+    parser.add_argument("--suitcase_only",        action="store_true",
+                        help="Run ONLY the suitcase evaluation (skip scripted).")
+    parser.add_argument("--suitcase_speakers",    type=str, nargs="+", default=None,
+                        help="Suitcase speaker IDs to evaluate. Defaults to the "
+                             "same list as --speakers (or DEFAULT_TEST_SPEAKERS).")
+    parser.add_argument("--max_chunk_duration",   type=float, default=10.0,
+                        help="Max chunk duration in seconds for suitcase chunking "
+                             "(default: 10.0).")
     args = parser.parse_args()
 
 
@@ -1168,7 +1522,9 @@ if __name__ == "__main__":
     # L2-ARCTIC scripted test speakers (Ye et al. 2022 / Shahin et al. 2025)
     DEFAULT_TEST_SPEAKERS = ["RRBI", "YBAA", "HJK", "BWC", "EBVS", "YDCK"]
     speakers = args.speakers if args.speakers else DEFAULT_TEST_SPEAKERS
-    print(f"Evaluating speakers: {speakers}")
+    # Suitcase speakers default to the same list unless overridden
+    suit_speakers = args.suitcase_speakers if args.suitcase_speakers else speakers
+
     print(f"Device: {args.device}\n")
 
     feature_extractor  = Wav2Vec2FeatureExtractor.from_pretrained(args.feature_extractor)
@@ -1197,13 +1553,40 @@ if __name__ == "__main__":
         phonological_model.eval()
         print("[phonological] Ready.")
 
-    results = evaluate_mdd(
-        l2arctic_root      = args.l2arctic_dir,
-        speakers           = speakers,
-        phoneme_model      = phoneme_model,
-        phonological_model = phonological_model,
-        feature_extractor  = feature_extractor,
-        device             = args.device,
-        output_json        = args.output_json,
-        verbose            = True,
-    )
+    # ── Scripted evaluation ───────────────────────────────────────────────────
+    if not args.suitcase_only:
+        print(f"Evaluating scripted speakers: {speakers}")
+        evaluate_mdd(
+            l2arctic_root      = args.l2arctic_dir,
+            speakers           = speakers,
+            phoneme_model      = phoneme_model,
+            phonological_model = phonological_model,
+            feature_extractor  = feature_extractor,
+            device             = args.device,
+            output_json        = args.output_json,
+            verbose            = True,
+        )
+
+    # ── Suitcase evaluation ───────────────────────────────────────────────────
+    if args.suitcase or args.suitcase_only:
+        # Derive suitcase output path from --output_json if given
+        suit_json = None
+        if args.output_json:
+            base = args.output_json
+            if base.endswith(".json"):
+                suit_json = base[:-5] + "_suitcase.json"
+            else:
+                suit_json = base + "_suitcase.json"
+
+        print(f"\nEvaluating suitcase speakers: {suit_speakers}")
+        evaluate_mdd_suitcase(
+            l2arctic_root      = args.l2arctic_dir,
+            speakers           = suit_speakers,
+            phoneme_model      = phoneme_model,
+            phonological_model = phonological_model,
+            feature_extractor  = feature_extractor,
+            device             = args.device,
+            output_json        = suit_json,
+            max_chunk_duration = args.max_chunk_duration,
+            verbose            = True,
+        )
