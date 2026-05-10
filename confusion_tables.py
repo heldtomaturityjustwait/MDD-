@@ -3,22 +3,8 @@ confusion_tables.py
 ===================
 Reproduce Tables 5 & 6 from Shahin et al. (2025).
 
-For each confused phoneme pair (A/B):
-
-  Phoneme-level:
-    FAR = among positions where speaker said B but canonical was A
-          (or A but canonical was B) → how often did model predict canonical
-    FRR = among positions where speaker correctly said A or B
-          → how often did model predict something other than canonical
-
-  Phonological-level:
-    For each DISTINCTIVE feature between A and B:
-      FAR_feat = same substitution positions → how often did model's
-                 decoded feature value == canonical feature value
-                 (i.e. wrong feature predicted — accepted the error)
-      FRR_feat = correct positions → how often model's decoded feature
-                 value != canonical feature value
-    Report the feature with lowest FAR.
+Alignment: predicted vs HUMAN sequence (Levenshtein), exactly as in
+mdd_evaluation.py — NOT vs canonical.
 
 Usage:
     python confusion_tables.py \
@@ -30,7 +16,6 @@ Usage:
 
 import argparse
 import sys
-import re
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
@@ -43,6 +28,11 @@ from phonological_features import (
     BLANK_IDX, PHONEME_FEATURES,
     feature_idx_to_pos_node, feature_idx_to_neg_node,
     phoneme_to_feature_vector,
+)
+from mdd_evaluation import (
+    parse_annotation_for_mdd,
+    _decode_sctcSB_logits_to_feature_sequences,
+    _phoneme_to_binary_array,
 )
 from dataset import normalize_phoneme
 
@@ -68,67 +58,157 @@ VOWEL_PAIRS = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Annotation parser
+# Levenshtein alignment — mirrors count_phoneme_mdd Step 1 exactly
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_annotation(textgrid_path):
-    """Returns list of (canonical, human) phone pairs. human=None for deletions."""
-    path = Path(textgrid_path)
-    if not path.exists():
-        return []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        content = f.read()
-    tier_blocks = re.split(r'item\s*\[\d+\]', content)
-    phones_block = None
-    for block in tier_blocks:
-        if re.search(r'name\s*=\s*"phones?"', block, re.IGNORECASE):
-            phones_block = block
-            break
-    if phones_block is None:
-        return []
-    intervals = re.findall(
-        r'intervals\s*\[\d+\].*?xmin\s*=\s*[\d.]+.*?xmax\s*=\s*[\d.]+'
-        r'.*?text\s*=\s*"([^"]*)"',
-        phones_block, re.DOTALL,
-    )
-    pairs = []
-    for text in intervals:
-        text = text.strip()
-        if text in ("", "sil", "sp", "spn", "<unk>"):
-            continue
-        parts = [p.strip() for p in text.split(",")]
-        if len(parts) == 1:
-            ph = normalize_phoneme(parts[0])
-            if ph != "sil":
-                pairs.append((ph, ph))  # correct
-        elif len(parts) == 3:
-            canon_raw, pron_raw, etype = parts
-            etype = etype.strip().lower()
-            canon = normalize_phoneme(canon_raw)
-            if canon == "sil":
-                continue
-            if etype == "s":
-                pron_clean = pron_raw.replace("*", "").strip()
-                if pron_clean.lower() == "err":
-                    human = None
-                else:
-                    human = normalize_phoneme(pron_clean)
-                    if human == "sil":
-                        human = None
-                pairs.append((canon, human))
-            elif etype == "d":
-                pairs.append((canon, None))
-            elif etype == "a":
-                pass  # no canonical slot
-    return pairs
+def _compute_alignment(human, predicted):
+    """
+    Align predicted against human sequence using Levenshtein, exactly
+    as in count_phoneme_mdd Step 1.
+
+    Returns:
+        asr_evl        : list[H] 'hit' | 'replace' | 'delete'
+        hyp_pos_arr    : list[H] index into predicted (-1 if delete)
+        asr_ins_errors : list of (ref_cursor, hyp_pos) for model insertions
+    """
+    H = len(human)
+    if H == 0:
+        return [], [], []
+    if not predicted:
+        return ["delete"] * H, [-1] * H, []
+
+    _, _, _, ops = levenshtein_alignment(human, predicted)
+
+    asr_evl        = ["hit"] * H
+    hyp_pos_arr    = list(range(H))
+    asr_ins_errors = []
+    hyp_offset     = 0
+    ref_cursor     = 0
+
+    for op, _ref, _hyp in ops:
+        if op == "I":
+            asr_ins_errors.append((ref_cursor, ref_cursor + hyp_offset))
+            for j in range(ref_cursor, H):
+                hyp_pos_arr[j] += 1
+            hyp_offset += 1
+        elif op == "D":
+            asr_evl[ref_cursor]     = "delete"
+            hyp_pos_arr[ref_cursor] = -1
+            for j in range(ref_cursor + 1, H):
+                hyp_pos_arr[j] -= 1
+            hyp_offset -= 1
+            ref_cursor += 1
+        else:
+            if op == "S":
+                asr_evl[ref_cursor] = "replace"
+            ref_cursor += 1
+
+    return asr_evl, hyp_pos_arr, asr_ins_errors
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CTC decode helpers
+# Per-pair accumulator
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_distinctive_features(ph_a, ph_b):
+    vec_a = phoneme_to_feature_vector(ph_a)
+    vec_b = phoneme_to_feature_vector(ph_b)
+    return [i for i in range(NUM_FEATURES) if vec_a[i] != vec_b[i]]
+
+
+class PairStats:
+    """
+    Accumulates FAR/FRR for one (a, b) confusion pair using the same
+    asr_evl x error classification as count_phoneme_mdd /
+    count_phonological_mdd.
+
+    Substitution positions (error='s', canon in {a,b}, human is the other):
+        Phoneme:  hit or replace → FA  (model accepted the error)
+                  delete         → TR  (model detected something wrong)
+        Feature:  same as count_phonological_mdd with cma check
+
+    Correct positions (error='c', canon=human in {a,b}):
+        Phoneme:  hit     → TA
+                  replace → FR
+                  delete  → FR
+        Feature:  same as count_phonological_mdd (cma always True for error='c')
+    """
+    def __init__(self, ph_a, ph_b):
+        self.ph_a = ph_a
+        self.ph_b = ph_b
+        self.dist_feat_idxs = _get_distinctive_features(ph_a, ph_b)
+
+        self.ph_FA = 0
+        self.ph_TR = 0
+        self.ph_FR = 0
+        self.ph_TA = 0
+
+        self.feat_FA = defaultdict(int)
+        self.feat_TR = defaultdict(int)
+        self.feat_FR = defaultdict(int)
+        self.feat_TA = defaultdict(int)
+
+    def add_phoneme_substitution(self, evl):
+        if evl in ("hit", "replace"):
+            self.ph_FA += 1
+        else:
+            self.ph_TR += 1
+
+    def add_phoneme_correct(self, evl):
+        if evl == "hit":
+            self.ph_TA += 1
+        else:
+            self.ph_FR += 1
+
+    def add_feat_substitution(self, evl, f_idx, cma):
+        """Mirrors count_phonological_mdd Step 2 for error='s'."""
+        if evl == "hit":
+            if cma:  self.feat_TA[f_idx] += 1
+            else:    self.feat_TR[f_idx] += 1
+        elif evl == "replace":
+            if cma:  self.feat_FR[f_idx] += 1
+            else:    self.feat_FA[f_idx] += 1
+        elif evl == "delete":
+            if cma:  self.feat_FR[f_idx] += 1
+            else:    self.feat_TR[f_idx] += 1
+
+    def add_feat_correct(self, evl, f_idx):
+        """error='c' → cma is always True."""
+        if evl == "hit":
+            self.feat_TA[f_idx] += 1
+        else:
+            self.feat_FR[f_idx] += 1
+
+    def phoneme_FAR(self):
+        d = self.ph_FA + self.ph_TR
+        return self.ph_FA / d * 100 if d > 0 else float("nan")
+
+    def phoneme_FRR(self):
+        d = self.ph_FR + self.ph_TA
+        return self.ph_FR / d * 100 if d > 0 else float("nan")
+
+    def best_feature(self):
+        """Return (feat_name, FAR%, FRR%) for the distinctive feature with lowest FAR."""
+        best_far = float("inf")
+        best = None
+        for f_idx in self.dist_feat_idxs:
+            fa = self.feat_FA[f_idx]
+            tr = self.feat_TR[f_idx]
+            fr = self.feat_FR[f_idx]
+            ta = self.feat_TA[f_idx]
+            far = fa / (fa + tr) * 100 if (fa + tr) > 0 else float("nan")
+            frr = fr / (fr + ta) * 100 if (fr + ta) > 0 else float("nan")
+            if not np.isnan(far) and far < best_far:
+                best_far = far
+                best = (PHONOLOGICAL_FEATURES[f_idx], far, frr)
+        return best
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CTC decode
 # ─────────────────────────────────────────────────────────────────────────────
 
 def ctc_decode_phoneme(logits_np, blank_idx=39):
-    """(T, 40) numpy → list of phoneme strings."""
     from phonological_features import CMU_39_PHONEMES
     preds = np.argmax(logits_np, axis=-1)
     phones, prev = [], -1
@@ -144,197 +224,6 @@ def ctc_decode_phoneme(logits_np, blank_idx=39):
     return phones
 
 
-def ctc_decode_phonological(logits_np, valid_len=None):
-    """
-    (T, 71) numpy → list[35] of decoded feature sequences (each: list of 0/1).
-    """
-    T = valid_len if valid_len else logits_np.shape[0]
-    logits_np = logits_np[:T]
-    decoded = []
-    for f in range(NUM_FEATURES):
-        pos = feature_idx_to_pos_node(f)
-        neg = feature_idx_to_neg_node(f)
-        cat = logits_np[:, [pos, neg, BLANK_IDX]]
-        preds = np.argmax(cat, axis=-1)
-        collapsed, prev = [], -1
-        for p in preds:
-            if p == 2:
-                prev = -1
-                continue
-            if p != prev:
-                collapsed.append(1 if p == 0 else 0)
-                prev = p
-        decoded.append(collapsed)
-    return decoded
-
-
-def align_phones_to_canonical(predicted_phones, canonical_phones):
-    """
-    Levenshtein-align predicted phoneme sequence against canonical sequence.
-
-    Returns:
-        aligned_phones : list[len(canonical)] of predicted phone str or None
-        aligned_indices: list[len(canonical)] of hyp index (int) or None
-            — the index into predicted_phones for each canonical slot,
-              used to look up the corresponding position in feature sequences.
-    """
-    n = len(canonical_phones)
-    if not canonical_phones:
-        return [], []
-    if not predicted_phones:
-        return [None] * n, [None] * n
-
-    _, _, _, ops = levenshtein_alignment(canonical_phones, predicted_phones)
-
-    aligned_phones  = []
-    aligned_indices = []
-    hyp_cursor = 0
-    for op, _ref, _hyp in ops:
-        if op in ("M", "S"):
-            aligned_phones.append(predicted_phones[hyp_cursor])
-            aligned_indices.append(hyp_cursor)
-            hyp_cursor += 1
-        elif op == "I":        # insertion — no canonical slot, discard
-            hyp_cursor += 1
-        elif op == "D":        # deletion — model missed this canonical slot
-            aligned_phones.append(None)
-            aligned_indices.append(None)
-    return aligned_phones, aligned_indices
-
-
-def lookup_feat_at_index(decoded_feats, f_idx, hyp_idx):
-    """
-    Look up the predicted feature value for feature f_idx at position hyp_idx
-    in the CTC-decoded feature sequences.
-
-    decoded_feats: list[NUM_FEATURES] of list[int] (0 or 1), from ctc_decode_phonological
-    hyp_idx      : int index into decoded_feats[f_idx], or None (model deletion)
-
-    Returns 0, 1, or None.
-    """
-    if hyp_idx is None:
-        return None
-    f_seq = decoded_feats[f_idx]
-    if hyp_idx < len(f_seq):
-        return f_seq[hyp_idx]
-    # hyp_idx beyond the feature sequence (can happen if phoneme and feature
-    # CTC paths have different lengths) — treat as deletion/None
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-pair accumulator
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_distinctive_features(ph_a, ph_b):
-    """Return indices of features that differ between ph_a and ph_b."""
-    vec_a = phoneme_to_feature_vector(ph_a)
-    vec_b = phoneme_to_feature_vector(ph_b)
-    return [i for i in range(NUM_FEATURES) if vec_a[i] != vec_b[i]]
-
-
-class PairStats:
-    """
-    Accumulates FAR/FRR counts for one (canonical_a, canonical_b) pair.
-
-    Phoneme-level:
-      substitution_positions: canonical=A, human=B (or canonical=B, human=A)
-        → FAR += 1 if predicted == canonical (error accepted)
-        → TR  += 1 if predicted != canonical (error detected)
-      correct_positions: canonical=A, human=A (or canonical=B, human=B)
-        → FRR += 1 if predicted != canonical (correct rejected)
-        → TA  += 1 if predicted == canonical
-
-    Phonological-level (per distinctive feature):
-      same positions, but compare feature values.
-    """
-    def __init__(self, ph_a, ph_b):
-        self.ph_a = ph_a
-        self.ph_b = ph_b
-        self.dist_feat_idxs = get_distinctive_features(ph_a, ph_b)
-
-        # Phoneme-level counts
-        self.ph_FA = 0   # substitution, model accepted (predicted canonical)
-        self.ph_TR = 0   # substitution, model rejected
-        self.ph_FR = 0   # correct, model rejected
-        self.ph_TA = 0   # correct, model accepted
-
-        # Phonological-level counts per distinctive feature
-        self.feat_FA = defaultdict(int)
-        self.feat_TR = defaultdict(int)
-        self.feat_FR = defaultdict(int)
-        self.feat_TA = defaultdict(int)
-
-    def add_substitution(self, canon, pred_phone, pred_feat_vals):
-        """
-        canon: the canonical phoneme at this position (A or B)
-        pred_phone: what the phoneme model predicted
-        pred_feat_vals: list[35] of predicted feature values (0/1/None)
-        """
-        # Phoneme-level
-        if pred_phone == canon:
-            self.ph_FA += 1
-        else:
-            self.ph_TR += 1
-
-        # Phonological-level
-        canon_vec = phoneme_to_feature_vector(canon)
-        for f_idx in self.dist_feat_idxs:
-            canon_f = 1 if canon_vec[f_idx] else 0
-            pred_f = pred_feat_vals[f_idx]
-            if pred_f is None:
-                # Model produced nothing (shorter decode) → treat as wrong
-                self.feat_TR[f_idx] += 1
-            elif pred_f == canon_f:
-                self.feat_FA[f_idx] += 1
-            else:
-                self.feat_TR[f_idx] += 1
-
-    def add_correct(self, canon, pred_phone, pred_feat_vals):
-        """Correct pronunciation position."""
-        # Phoneme-level
-        if pred_phone == canon:
-            self.ph_TA += 1
-        else:
-            self.ph_FR += 1
-
-        # Phonological-level
-        canon_vec = phoneme_to_feature_vector(canon)
-        for f_idx in self.dist_feat_idxs:
-            canon_f = 1 if canon_vec[f_idx] else 0
-            pred_f = pred_feat_vals[f_idx]
-            if pred_f is None:
-                self.feat_FR[f_idx] += 1
-            elif pred_f == canon_f:
-                self.feat_TA[f_idx] += 1
-            else:
-                self.feat_FR[f_idx] += 1
-
-    def phoneme_FAR(self):
-        d = self.ph_FA + self.ph_TR
-        return self.ph_FA / d * 100 if d > 0 else float("nan")
-
-    def phoneme_FRR(self):
-        d = self.ph_FR + self.ph_TA
-        return self.ph_FR / d * 100 if d > 0 else float("nan")
-
-    def best_feature(self):
-        """Return (feat_name, FAR, FRR) for the distinctive feature with lowest FAR."""
-        best_far = float("inf")
-        best = None
-        for f_idx in self.dist_feat_idxs:
-            fa = self.feat_FA[f_idx]
-            tr = self.feat_TR[f_idx]
-            fr = self.feat_FR[f_idx]
-            ta = self.feat_TA[f_idx]
-            far = fa / (fa + tr) * 100 if (fa + tr) > 0 else float("nan")
-            frr = fr / (fr + ta) * 100 if (fr + ta) > 0 else float("nan")
-            if not np.isnan(far) and far < best_far:
-                best_far = far
-                best = (PHONOLOGICAL_FEATURES[f_idx], far, frr)
-        return best  # (feature_name, FAR%, FRR%)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Main evaluation loop
 # ─────────────────────────────────────────────────────────────────────────────
@@ -346,11 +235,14 @@ def run_confusion_analysis(
 ):
     import torch, torchaudio
 
-    # Build all pair stats
     all_pairs = CONSONANT_PAIRS + VOWEL_PAIRS
-    pair_stats = {}
-    for a, b in all_pairs:
-        pair_stats[(a, b)] = PairStats(a, b)
+    pair_stats = {(a, b): PairStats(a, b) for a, b in all_pairs}
+
+    # For each canonical phone, which pairs need scoring?
+    pairs_for_phone = defaultdict(list)
+    for (a, b) in all_pairs:
+        pairs_for_phone[a].append((a, b))
+        pairs_for_phone[b].append((a, b))
 
     root = Path(l2arctic_dir)
 
@@ -361,20 +253,32 @@ def run_confusion_analysis(
             print(f"  Skipping {spk}: no annotation dir")
             continue
 
-        for ann_file in sorted(ann_dir.glob("*.TextGrid")):
+        ann_files = sorted(ann_dir.glob("*.TextGrid"))
+        print(f"  [{spk}] {len(ann_files)} utterances")
+
+        for ann_file in ann_files:
             utt_id   = ann_file.stem
             wav_file = wav_dir / f"{utt_id}.wav"
             if not wav_file.exists():
                 continue
 
-            pairs = parse_annotation(str(ann_file))
-            if not pairs:
+            # ── Annotation ─────────────────────────────────────────────────
+            (human, canonical, pron_errors,
+             exp_trans, act_trans, ori_indx) = parse_annotation_for_mdd(str(ann_file))
+            if not human:
                 continue
 
-            # canonical sequence — what should have been said at each position
-            canonical_seq = [canon for canon, _ in pairs]
+            H     = len(human)
+            n_ann = len(pron_errors)
 
-            # Load audio
+            # Per-interval feature vectors (for cma check)
+            canon_feats_by_ori  = np.zeros((n_ann, NUM_FEATURES), dtype=np.int8)
+            actual_feats_by_ori = np.zeros((n_ann, NUM_FEATURES), dtype=np.int8)
+            for ann_i in range(n_ann):
+                canon_feats_by_ori[ann_i]  = _phoneme_to_binary_array(exp_trans[ann_i])
+                actual_feats_by_ori[ann_i] = _phoneme_to_binary_array(act_trans[ann_i])
+
+            # ── Audio ──────────────────────────────────────────────────────
             waveform, sr = torchaudio.load(str(wav_file))
             if sr != 16000:
                 waveform = torchaudio.functional.resample(waveform, sr, 16000)
@@ -385,102 +289,97 @@ def run_confusion_analysis(
                 return_tensors="pt", padding=True,
             )
 
-            # ── Phoneme model ────────────────────────────────────────────────
+            # ── Phoneme model → align vs HUMAN ─────────────────────────────
             with torch.no_grad():
                 ph_logits, ph_lengths = phoneme_model(
                     inputs.input_values.to(device),
                     inputs.attention_mask.to(device),
                 )
             ph_logits_np = ph_logits.squeeze(0).cpu().numpy()
-            ph_len = int(ph_lengths[0].item())
-            predicted_phones = ctc_decode_phoneme(ph_logits_np[:ph_len])
+            ph_len       = int(ph_lengths[0].item())
+            predicted_ph = ctc_decode_phoneme(ph_logits_np[:ph_len])
 
-            # Levenshtein-align predicted phones against canonical sequence.
-            # Each canonical slot gets the aligned predicted phone (None = deletion).
-            ph_aligned, ph_hyp_indices = align_phones_to_canonical(predicted_phones, canonical_seq)
+            ph_evl, _, _ = _compute_alignment(human, predicted_ph)
 
-            # ── Phonological model ───────────────────────────────────────────
-            # We derive per-position feature values directly from the
-            # phoneme-aligned output (ph_aligned) rather than separately
-            # aligning 35 binary feature sequences. Aligning binary sequences
-            # against each other is highly ambiguous (many equal-cost paths)
-            # and produces wrong-length outputs. Using the phone-level
-            # Levenshtein alignment as the single source of truth is both
-            # correct and stable: None slots (model deletions) propagate
-            # through phone_to_feature_vals as None, and predicted phones
-            # are converted to their feature vectors at the aligned position.
-            #
-            # The phonological model logits are still used — but only to
-            # re-score individual feature decisions at positions where the
-            # phoneme model has already established an alignment. For each
-            # aligned canonical slot we look up the per-feature logit at
-            # the corresponding frame range via the phonological model output,
-            # and override the phone-derived feature value with the model's
-            # direct per-feature prediction. This keeps alignment stable
-            # while using the phonological model's actual feature predictions.
+            # ── Phonological model → per-feature align vs HUMAN binary ─────
             with torch.no_grad():
                 feat_logits, feat_lengths = phonological_model(
                     inputs.input_values.to(device),
                     inputs.attention_mask.to(device),
                 )
             feat_logits_np = feat_logits.squeeze(0).cpu().numpy()
-            feat_len = int(feat_lengths[0].item())
-            decoded_feats = ctc_decode_phonological(feat_logits_np, feat_len)
+            feat_len       = int(feat_lengths[0].item())
+            pred_feat_seqs = _decode_sctcSB_logits_to_feature_sequences(
+                feat_logits_np[:feat_len]
+            )
 
-            # For each aligned canonical position, derive feature values by
-            # aligning each per-feature decoded sequence against the aligned
-            # phoneme sequence length (not the raw canonical binary vector).
-            # This guarantees feat_aligned[f] always has exactly len(pairs)
-            # entries, with None where ph_aligned[i] is None.
-            # For each canonical slot i, use ph_hyp_indices[i] (the index of
-            # the aligned predicted phone in the CTC output) to look up the
-            # phonological model's per-feature value at that same position.
-            # This reuses the single stable phone-level alignment and avoids
-            # aligning 35 separate binary sequences (which is ill-conditioned).
-            n = len(pairs)
-            feat_aligned = []
+            human_feats = np.stack(      # (H, 35)
+                [_phoneme_to_binary_array(ph) for ph in human]
+            )
+
+            # Align each feature sequence vs human binary (same as
+            # count_phonological_mdd Step 1, one per feature)
+            feat_evl_all = []
             for f_idx in range(NUM_FEATURES):
-                feat_aligned.append([
-                    lookup_feat_at_index(decoded_feats, f_idx, ph_hyp_indices[i])
-                    for i in range(n)
-                ])
+                human_binary = human_feats[:, f_idx].astype(int).tolist()
+                pred_binary  = pred_feat_seqs[f_idx]
+                f_evl, _, _  = _compute_alignment(human_binary, pred_binary)
+                feat_evl_all.append(f_evl)
 
-            # ── Score each canonical position ────────────────────────────────
-            for i, (canon, human) in enumerate(pairs):
-                pred_phone    = ph_aligned[i]
-                pred_feat_vals = [feat_aligned[f][i] for f in range(NUM_FEATURES)]
+            # ── Score each human-sequence position ─────────────────────────
+            for ref_pos, ori_pos in zip(range(H), ori_indx):
+                error  = pron_errors[ori_pos]
+                canon  = exp_trans[ori_pos]
+                actual = act_trans[ori_pos]
 
-                for (a, b), stats in pair_stats.items():
-                    is_sub_ab    = (canon == a and human == b)
-                    is_sub_ba    = (canon == b and human == a)
-                    is_correct_a = (canon == a and human == a)
-                    is_correct_b = (canon == b and human == b)
+                if error not in ("c", "s"):
+                    continue
 
-                    if is_sub_ab or is_sub_ba:
-                        stats.add_substitution(canon, pred_phone, pred_feat_vals)
-                    elif is_correct_a or is_correct_b:
-                        stats.add_correct(canon, pred_phone, pred_feat_vals)
+                relevant = pairs_for_phone.get(canon, [])
+                if not relevant:
+                    continue
+
+                ph_ev = ph_evl[ref_pos]
+
+                for (a, b) in relevant:
+                    stats = pair_stats[(a, b)]
+                    other = b if canon == a else a
+
+                    if error == "s" and actual != other:
+                        # Substitution but human said something outside this pair
+                        continue
+
+                    # ── Phoneme-level ──────────────────────────────────────
+                    if error == "s":
+                        stats.add_phoneme_substitution(ph_ev)
+                    else:
+                        stats.add_phoneme_correct(ph_ev)
+
+                    # ── Phonological-level ─────────────────────────────────
+                    for f_idx in stats.dist_feat_idxs:
+                        f_ev = feat_evl_all[f_idx][ref_pos]
+                        cf   = int(canon_feats_by_ori[ori_pos, f_idx])
+                        af   = int(actual_feats_by_ori[ori_pos, f_idx])
+                        cma  = (cf == af)
+                        if error == "s":
+                            stats.add_feat_substitution(f_ev, f_idx, cma)
+                        else:
+                            stats.add_feat_correct(f_ev, f_idx)
 
     return pair_stats
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Table printer
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _bold(s):
-    """Wrap string in ANSI bold for terminal output."""
     return f"\033[1m{s}\033[0m"
 
 
 def print_table(pair_list, pair_stats, title):
-    """
-    Print a table matching Tables 5 & 6 in Shahin et al. (2025).
-
-    Columns: Conf_ph | Phonetic FAR | Phonetic FRR | Feature | Phonological FAR | Phonological FRR
-
-    The lower value in each FAR/FRR pair (phonetic vs phonological) is bolded,
-    matching the paper's bold convention.
-    """
     SEP = "─" * 68
     HDR = "=" * 68
-
     print(f"\n{HDR}")
     print(f"  {title}")
     print(f"{HDR}")
@@ -490,14 +389,12 @@ def print_table(pair_list, pair_stats, title):
 
     far_improvements = []
     for a, b in pair_list:
-        key = (a, b)
-        stats = pair_stats.get(key)
+        stats   = pair_stats.get((a, b))
         if stats is None:
             continue
-
-        ph_far = stats.phoneme_FAR()
-        ph_frr = stats.phoneme_FRR()
-        best   = stats.best_feature()
+        ph_far  = stats.phoneme_FAR()
+        ph_frr  = stats.phoneme_FRR()
+        best    = stats.best_feature()
         conf_ph = f"{a}/{b}"
 
         if best is None:
@@ -508,7 +405,6 @@ def print_table(pair_list, pair_stats, title):
 
         feat_name, feat_far, feat_frr = best
 
-        # Bold the lower FAR
         if not (np.isnan(ph_far) or np.isnan(feat_far)):
             if feat_far <= ph_far:
                 ph_far_s, feat_far_s = f"{ph_far:7.2f}", _bold(f"{feat_far:7.2f}")
@@ -518,7 +414,6 @@ def print_table(pair_list, pair_stats, title):
             ph_far_s   = f"{ph_far:7.2f}"   if not np.isnan(ph_far)   else "    n/a"
             feat_far_s = f"{feat_far:7.2f}" if not np.isnan(feat_far) else "    n/a"
 
-        # Bold the lower FRR
         if not (np.isnan(ph_frr) or np.isnan(feat_frr)):
             if feat_frr <= ph_frr:
                 ph_frr_s, feat_frr_s = f"{ph_frr:7.2f}", _bold(f"{feat_frr:7.2f}")
@@ -540,6 +435,10 @@ def print_table(pair_list, pair_stats, title):
               f"(avg improvement: {np.mean(far_improvements):+.1f}%)")
     print()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
