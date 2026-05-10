@@ -149,9 +149,17 @@ class PairStats:
         self.feat_TA = defaultdict(int)
 
     def add_phoneme_substitution(self, evl):
-        if evl in ("hit", "replace"):
-            self.ph_FA += 1
-        else:
+        """
+        Mirrors count_phoneme_mdd classification for error='s':
+            hit     + s → TR+CD  (model agreed with human error = detected it)
+            replace + s → FA     (model predicted canonical despite human error)
+            delete  + s → TR+DE  (model missed, but at least didn't accept canon)
+        FA = model accepted the error (predicted canonical).
+        TR = model detected something was wrong (did NOT predict canonical).
+        """
+        if evl == "replace":
+            self.ph_FA += 1   # model output ≠ human AND aligned as substitute → predicted canonical
+        else:                  # hit (TR+CD) or delete (TR+DE)
             self.ph_TR += 1
 
     def add_phoneme_correct(self, evl):
@@ -161,16 +169,24 @@ class PairStats:
             self.ph_FR += 1
 
     def add_feat_substitution(self, evl, f_idx, cma):
-        """Mirrors count_phonological_mdd Step 2 for error='s'."""
+        """
+        Mirrors count_phonological_mdd Step 2 for error='s' exactly:
+            hit    + s + cma     → TA    (feature unchanged, model correctly hit)
+            hit    + s + not cma → TR_CD (model caught the feature change)
+            replace+ s + cma     → FR    (feature unchanged, model wrongly flagged)
+            replace+ s + not cma → FA    (feature changed, model accepted it)
+            delete + s + cma     → FR    (feature unchanged, model missed)
+            delete + s + not cma → TR_DE (feature changed, model detected but wrong)
+        """
         if evl == "hit":
             if cma:  self.feat_TA[f_idx] += 1
-            else:    self.feat_TR[f_idx] += 1
+            else:    self.feat_TR[f_idx] += 1   # TR_CD
         elif evl == "replace":
             if cma:  self.feat_FR[f_idx] += 1
             else:    self.feat_FA[f_idx] += 1
         elif evl == "delete":
             if cma:  self.feat_FR[f_idx] += 1
-            else:    self.feat_TR[f_idx] += 1
+            else:    self.feat_TR[f_idx] += 1   # TR_DE
 
     def add_feat_correct(self, evl, f_idx):
         """error='c' → cma is always True."""
@@ -299,7 +315,7 @@ def run_confusion_analysis(
             ph_len       = int(ph_lengths[0].item())
             predicted_ph = ctc_decode_phoneme(ph_logits_np[:ph_len])
 
-            ph_evl, _, _ = _compute_alignment(human, predicted_ph)
+            ph_evl, ph_hyp_pos, _ = _compute_alignment(human, predicted_ph)
 
             # ── Phonological model → per-feature align vs HUMAN binary ─────
             with torch.no_grad():
@@ -351,7 +367,19 @@ def run_confusion_analysis(
 
                     # ── Phoneme-level ──────────────────────────────────────
                     if error == "s":
-                        stats.add_phoneme_substitution(ph_ev)
+                        # For replace: check if model predicted canonical (FA)
+                        # vs something else (TR+DE). hit=TR+CD, delete=TR+DE.
+                        if ph_ev == "replace":
+                            hyp_idx = ph_hyp_pos[ref_pos]
+                            pred_phone = (predicted_ph[hyp_idx]
+                                          if hyp_idx >= 0 and hyp_idx < len(predicted_ph)
+                                          else None)
+                            if pred_phone == canon:
+                                stats.ph_FA += 1   # model predicted canonical = accepted error
+                            else:
+                                stats.ph_TR += 1   # model output ≠ human AND ≠ canonical → TR+DE
+                        else:
+                            stats.add_phoneme_substitution(ph_ev)  # hit→TR+CD, delete→TR+DE
                     else:
                         stats.add_phoneme_correct(ph_ev)
 
